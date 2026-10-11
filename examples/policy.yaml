@@ -1,0 +1,31 @@
+# Example MCP Warden policy.
+#
+# Resolution: every matching rule is collected and the most restrictive effect
+# wins (deny > require_approval > allow). Rule order never weakens a deny.
+# If nothing matches, `default` applies.
+version: 1
+default: deny
+
+rules:
+  - id: read-only-everywhere
+    effect: allow
+    description: Any agent may use read-style tools on any server.
+    tools: ["get_*", "list_*", "search_*", "read_*"]
+
+  - id: support-bot-tickets
+    effect: allow
+    description: The support bot may create and update tickets.
+    agents: ["support-bot"]
+    servers: ["tickets"]
+    tools: ["create_ticket", "update_ticket"]
+
+  - id: writes-need-a-human
+    effect: require_approval
+    description: Writes to source control need human sign-off.
+    servers: ["github"]
+    tools: ["create_*", "update_*", "merge_*", "push_*"]
+
+  - id: never-destructive
+    effect: deny
+    description: Destructive tools are never allowed through the gateway.
+    tools: ["delete_*", "drop_*", "*_delete", "purge_*"]
