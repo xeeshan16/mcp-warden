@@ -1,0 +1,149 @@
+"""Typed views of the MCP methods the gateway inspects.
+
+Only the messages that carry policy-relevant information are modelled:
+``initialize`` (who is the client, which protocol revision), ``tools/list``
+(what the agent can see) and ``tools/call`` (what it wants to run). Every other
+method is passed through as an opaque JSON-RPC message.
+
+Unlike the JSON-RPC envelope, these models allow unknown members: MCP adds
+optional fields between revisions, and the gateway must forward them intact.
+Fields the gateway relies on are validated strictly.
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
+
+from mcp_warden.jsonrpc.errors import ErrorCode, JsonRpcError
+from mcp_warden.jsonrpc.messages import JsonRpcRequest
+
+# Newest first. The 2025-06-18 revision removed JSON-RPC batching from MCP.
+SUPPORTED_PROTOCOL_VERSIONS: tuple[str, ...] = ("2025-11-25", "2025-06-18", "2025-03-26")
+LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0]
+_BATCHING_REMOVED_IN = "2025-06-18"
+
+_OPEN = ConfigDict(extra="allow", frozen=True, populate_by_name=True)
+
+_TOOL_NAME = r"^[A-Za-z0-9_.:/-]{1,200}$"
+
+
+class Method(StrEnum):
+    INITIALIZE = "initialize"
+    INITIALIZED = "notifications/initialized"
+    PING = "ping"
+    TOOLS_LIST = "tools/list"
+    TOOLS_CALL = "tools/call"
+    TOOLS_LIST_CHANGED = "notifications/tools/list_changed"
+    CANCELLED = "notifications/cancelled"
+
+
+class Implementation(BaseModel):
+    model_config = _OPEN
+
+    name: StrictStr = Field(min_length=1, max_length=200)
+    version: StrictStr = Field(max_length=100)
+
+
+class InitializeParams(BaseModel):
+    model_config = _OPEN
+
+    protocol_version: StrictStr = Field(alias="protocolVersion", min_length=1, max_length=40)
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    client_info: Implementation = Field(alias="clientInfo")
+
+
+class InitializeResult(BaseModel):
+    model_config = _OPEN
+
+    protocol_version: StrictStr = Field(alias="protocolVersion")
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    server_info: Implementation = Field(alias="serverInfo")
+    instructions: StrictStr | None = None
+
+
+class ListToolsParams(BaseModel):
+    model_config = _OPEN
+
+    cursor: StrictStr | None = None
+
+
+class Tool(BaseModel):
+    model_config = _OPEN
+
+    name: StrictStr = Field(pattern=_TOOL_NAME)
+    description: StrictStr | None = None
+    input_schema: dict[str, Any] = Field(alias="inputSchema")
+
+
+class ListToolsResult(BaseModel):
+    model_config = _OPEN
+
+    tools: list[Tool]
+    next_cursor: StrictStr | None = Field(default=None, alias="nextCursor")
+
+
+class CallToolParams(BaseModel):
+    model_config = _OPEN
+
+    name: StrictStr = Field(pattern=_TOOL_NAME)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class CallToolResult(BaseModel):
+    model_config = _OPEN
+
+    content: list[dict[str, Any]] = Field(default_factory=list)
+    is_error: bool = Field(default=False, alias="isError")
+    structured_content: dict[str, Any] | None = Field(default=None, alias="structuredContent")
+
+
+def _validate[M: BaseModel](model: type[M], data: Any, what: str) -> M:
+    try:
+        return model.model_validate(data)
+    except ValidationError as exc:
+        err = exc.errors()[0]
+        loc = ".".join(str(p) for p in err["loc"]) or "params"
+        raise JsonRpcError(
+            ErrorCode.INVALID_PARAMS, f"invalid {what} params: {loc}: {err['msg']}"
+        ) from exc
+
+
+def parse_initialize(request: JsonRpcRequest) -> InitializeParams:
+    return _validate(InitializeParams, request.params_object(), Method.INITIALIZE)
+
+
+def parse_list_tools(request: JsonRpcRequest) -> ListToolsParams:
+    return _validate(ListToolsParams, request.params_object(), Method.TOOLS_LIST)
+
+
+def parse_call_tool(request: JsonRpcRequest) -> CallToolParams:
+    return _validate(CallToolParams, request.params_object(), Method.TOOLS_CALL)
+
+
+def parse_list_tools_result(result: Any) -> ListToolsResult:
+    return _validate(ListToolsResult, result, "tools/list result")
+
+
+def negotiate_protocol_version(requested: str) -> str:
+    """Pick the version to answer ``initialize`` with.
+
+    Per MCP, a server that supports the requested revision echoes it; otherwise
+    it answers with the latest revision it supports and lets the client decide
+    whether to disconnect.
+    """
+    return requested if requested in SUPPORTED_PROTOCOL_VERSIONS else LATEST_PROTOCOL_VERSION
+
+
+def batching_allowed(protocol_version: str | None) -> bool:
+    """Whether JSON-RPC batches are valid for the negotiated MCP revision.
+
+    Before a session is initialised the revision is unknown, so batches are
+    refused: ``initialize`` must not be part of a batch anyway.
+    """
+    if protocol_version is None:
+        return False
+    # Revision strings are ISO dates, so lexical order is chronological order.
+    return protocol_version < _BATCHING_REMOVED_IN
