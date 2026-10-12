@@ -46,3 +46,5 @@ composes them as a pipeline so a stage can short-circuit with a JSON-RPC error.
 ## Change log
 
 - 2026-10-11: plan written out on day 1 from the approved proposal.
+- 2026-10-12: day 2 done as planned. Batches are parsed but will only be accepted for
+  sessions on MCP revisions before 2025-06-18, which removed batching.

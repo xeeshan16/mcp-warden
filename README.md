@@ -6,7 +6,7 @@
 **A self-hosted policy, budget and audit gateway for AI agent tool calls over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).**
 
-> Status: under active development (day 1 of a 14-day build). See
+> Status: under active development (day 2 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md)
 > for the daily log. Features marked _planned_ are not implemented yet.
 
@@ -33,6 +33,8 @@ with a policy file you can review in a pull request.
 | Deny-overrides resolution that rule order can never weaken | ✅ day 1 |
 | Policy validation CLI with dry-run decisions (`mcp-warden check`) | ✅ day 1 |
 | Policy dry-run HTTP API (`POST /v1/policy/evaluate`) | ✅ day 1 |
+| Hardened JSON-RPC 2.0 parser (size, depth and batch limits; duplicate keys rejected) | ✅ day 2 |
+| Typed MCP messages (`initialize`, `tools/list`, `tools/call`) and protocol negotiation | ✅ day 2 |
 | MCP JSON-RPC proxy (Streamable HTTP) with `tools/list` filtering | _planned_ |
 | Per-agent API keys (hashed at rest) | _planned_ |
 | Argument constraints on tool calls | _planned_ |
@@ -61,9 +63,9 @@ flowchart LR
     W -.-> M[Prometheus / OTel]
 ```
 
-Day 1 implements the policy engine, its loader and validation, and the HTTP and CLI
-surfaces around it. The proxy path and the stages after the policy engine land over the
-following days (see the plan).
+So far the policy engine (day 1) and the JSON-RPC / MCP message layer (day 2) are in
+place. The proxy path and the stages after the policy engine land over the following
+days (see the plan).
 
 ### Policy resolution
 
@@ -92,6 +94,31 @@ rules:
 Unknown keys, duplicate rule ids, empty pattern lists and unsupported versions are
 rejected at load time, so a typo fails loudly instead of silently widening access.
 
+### Parsing untrusted JSON-RPC
+
+Everything an agent sends passes through `mcp_warden.jsonrpc.parse_payload` before any
+decision is made. It enforces a byte cap before decoding, strict UTF-8, a nesting-depth
+cap and a batch-size cap, and it rejects `NaN`/`Infinity` literals and **duplicate object
+keys**: if `{"name": "get_issue", "name": "delete_repo"}` were accepted, the gateway and
+the upstream server could disagree about which tool is being called. Invalid entries in a
+batch get their own JSON-RPC error instead of failing the whole batch.
+
+Gateway refusals use codes from the JSON-RPC server-error range so clients can tell them
+apart from upstream failures:
+
+| Code | Meaning |
+| --- | --- |
+| -32001 | denied by policy |
+| -32002 | human approval required |
+| -32003 | rate limited |
+| -32004 | budget exhausted |
+| -32005 / -32006 | upstream error / upstream timeout |
+| -32007 | payload too large |
+| -32008 | unauthenticated |
+
+MCP revisions from 2025-06-18 onward removed JSON-RPC batching, so batches are only
+accepted for sessions that negotiated an older revision.
+
 ## Quick start
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
@@ -113,7 +140,8 @@ curl -s localhost:8080/v1/policy/evaluate \
 ```
 
 Configuration is read from `WARDEN_*` environment variables (`WARDEN_POLICY_PATH`,
-`WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`).
+`WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`, and the parser limits
+`WARDEN_MAX_MESSAGE_BYTES`, `WARDEN_MAX_JSON_DEPTH`, `WARDEN_MAX_BATCH_SIZE`).
 
 ## Development
 
