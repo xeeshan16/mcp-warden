@@ -11,3 +11,6 @@ build/
 .coverage
 coverage.xml
 htmlcov/
+CLAUDE.md
+AGENTS.md
+.claude/
