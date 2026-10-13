@@ -1,0 +1,17 @@
+# Upstream MCP servers that MCP Warden forwards to.
+#
+# Agents reach each server at  http://<warden>/mcp/<name>.
+# Credentials never go in this file: `headers_from_env` maps an outgoing header
+# to the name of an environment variable that is read at startup.
+version: 1
+servers:
+  - name: demo
+    description: The deterministic fake MCP server (`mcp-warden fake-upstream`).
+    url: http://127.0.0.1:9001/mcp
+    timeout_seconds: 10
+
+  # - name: github
+  #   url: https://mcp.example.internal/github/mcp
+  #   timeout_seconds: 30
+  #   headers_from_env:
+  #     Authorization: GITHUB_MCP_AUTHORIZATION
