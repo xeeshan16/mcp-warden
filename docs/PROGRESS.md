@@ -56,3 +56,37 @@ mypy clean.
 **Next (day 3):** proxy core: Streamable HTTP endpoint `/mcp/{server}` forwarding to
 upstreams via httpx, upstream registry from config, a deterministic fake MCP server for
 tests, timeouts and upstream error mapping.
+
+## Day 3 — 2026-10-13: proxy core
+
+**Done**
+
+- `mcp_warden.upstreams`: YAML upstream registry (`examples/upstreams.yaml`), strict
+  validation (http/https URLs, unique names, timeouts, no extra keys), and upstream
+  credentials via `headers_from_env`, resolved at startup so a missing variable stops
+  the gateway. Gateway-owned headers (session, protocol version, framing) cannot be
+  configured, and resolved credentials never appear in `repr`.
+- `mcp_warden.proxy.client`: Streamable HTTP upstream client on a shared
+  `httpx.AsyncClient`. Handles `application/json` and `text/event-stream` replies (own
+  incremental SSE decoder), returns the response whose id matches, enforces a
+  whole-reply deadline and a response size cap, and maps connect errors, HTTP errors,
+  timeouts and malformed or mismatched replies to `-32005` / `-32006`. Upstream parse
+  failures are relabelled so the agent never sees a `PARSE_ERROR` for the server's bytes.
+- `mcp_warden.proxy.service` and `POST /mcp/{server}`: unknown servers refused before
+  any network call, capped body read, hardened parsing, batches only for pre-2025-06-18
+  revisions and forwarded entry by entry, `tools/call` params validated before
+  forwarding, notifications acknowledged with `202`, upstream session 404s passed
+  through, `Mcp-Session-Id` relayed back. Only the session and protocol-version headers
+  cross from agent to upstream. `GET`/`DELETE` answer `405`.
+- `mcp_warden.fake_upstream` and `mcp-warden fake-upstream [--sse]`: deterministic fake
+  MCP server with sessions and read, write, destructive and slow tools.
+- `mcp-warden serve --upstreams`.
+
+**Tests:** 179 passing locally (76 new), 97% line coverage; ruff, ruff format and strict
+mypy clean. The end-to-end tests run agent → gateway → fake upstream in-process for both
+JSON and SSE upstreams. Also verified by hand with both servers running under uvicorn
+(output in the README), including the upstream-down case.
+
+**Next (day 4):** policy enforcement in the proxy: check `tools/call` against the policy,
+filter `tools/list` responses, add argument constraints to rules, and return denials as
+JSON-RPC errors. Agent identity is a placeholder header until day 5.
