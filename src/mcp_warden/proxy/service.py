@@ -1,0 +1,154 @@
+"""The proxy pipeline for one ``POST /mcp/{server}`` call.
+
+Responsibilities, in order:
+
+1. resolve the upstream by name (unknown servers never reach the network);
+2. parse the payload with the hardened parser; batches are accepted only when
+   the client declared an MCP revision that still allowed them;
+3. handle each message: requests are forwarded and answered, notifications and
+   client responses are forwarded and acknowledged with ``202``;
+4. map every upstream failure onto a JSON-RPC error carrying the request id.
+
+Batch entries are forwarded one by one (concurrently) rather than as a batch.
+That keeps per-call checks — policy, rate limits, budgets from the following
+milestones — independent of how the agent packaged its calls, and means an
+upstream never sees a batch it might not support.
+
+Only ``Mcp-Session-Id`` and ``MCP-Protocol-Version`` cross the gateway from
+the agent. The agent's own credentials (``Authorization`` and the like) are
+for the gateway, never for the upstream; upstream credentials come from the
+upstream registry.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
+from typing import Any
+
+from mcp_warden.jsonrpc import (
+    ErrorCode,
+    InvalidMessage,
+    JsonRpcError,
+    JsonRpcErrorResponse,
+    JsonRpcRequest,
+    ParsedItem,
+    ParseLimits,
+    error_response,
+    error_response_from,
+    parse_payload,
+    to_wire,
+)
+from mcp_warden.jsonrpc.mcp import Method, batching_allowed, parse_call_tool
+from mcp_warden.proxy.client import (
+    PROTOCOL_HEADER,
+    SESSION_HEADER,
+    UpstreamResponse,
+    UpstreamSessionNotFoundError,
+    UpstreamTransport,
+)
+from mcp_warden.upstreams import Upstream, UpstreamRegistry
+
+FORWARDED_HEADERS: tuple[str, ...] = (SESSION_HEADER, PROTOCOL_HEADER)
+
+
+@dataclass(frozen=True, slots=True)
+class ProxyResult:
+    """An HTTP-level answer: status, optional JSON body, extra headers."""
+
+    status: int
+    body: Any = None
+    headers: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _Outcome:
+    response: UpstreamResponse | JsonRpcErrorResponse | None = None
+    session_id: str | None = None
+
+
+def forwarded_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    lowered = {k.lower(): v for k, v in headers.items()}
+    return {name: lowered[name] for name in FORWARDED_HEADERS if lowered.get(name)}
+
+
+class ProxyService:
+    def __init__(
+        self,
+        registry: UpstreamRegistry,
+        transport: UpstreamTransport,
+        limits: ParseLimits | None = None,
+    ) -> None:
+        self.registry = registry
+        self.transport = transport
+        self.limits = limits or ParseLimits()
+
+    async def handle(self, server: str, body: bytes, headers: Mapping[str, str]) -> ProxyResult:
+        upstream = self.registry.get(server)
+        if upstream is None:
+            err = error_response(
+                None, ErrorCode.INVALID_REQUEST, "unknown server", {"server": server}
+            )
+            return ProxyResult(404, to_wire(err))
+
+        forwarded = forwarded_headers(headers)
+        limits = replace(self.limits, allow_batch=batching_allowed(forwarded.get(PROTOCOL_HEADER)))
+        try:
+            parsed = parse_payload(body, limits)
+        except JsonRpcError as exc:
+            status = 413 if exc.code == ErrorCode.PAYLOAD_TOO_LARGE else 400
+            return ProxyResult(status, to_wire(error_response_from(exc, None)))
+
+        if not parsed.is_batch and isinstance(parsed.items[0], InvalidMessage):
+            return ProxyResult(400, to_wire(parsed.items[0].error))
+
+        try:
+            outcomes = await asyncio.gather(
+                *(self._handle_item(upstream, item, forwarded) for item in parsed.items)
+            )
+        except UpstreamSessionNotFoundError:
+            # MCP: a 404 for a session id tells the client to re-initialise.
+            return ProxyResult(404)
+
+        out_headers: dict[str, str] = {}
+        session_id = next((o.session_id for o in outcomes if o.session_id), None)
+        if session_id:
+            out_headers[SESSION_HEADER] = session_id
+
+        responses = [to_wire(o.response) for o in outcomes if o.response is not None]
+        if not responses:
+            return ProxyResult(202, None, out_headers)
+        return ProxyResult(200, responses if parsed.is_batch else responses[0], out_headers)
+
+    async def _handle_item(
+        self, upstream: Upstream, item: ParsedItem, forwarded: Mapping[str, str]
+    ) -> _Outcome:
+        if isinstance(item, InvalidMessage):
+            return _Outcome(item.error)
+        if isinstance(item, JsonRpcRequest):
+            return await self._forward_request(upstream, item, forwarded)
+        # Notifications and the agent's responses to server-initiated requests
+        # have nobody to report a failure to, so failures end here.
+        try:
+            reply = await self.transport.send(
+                upstream, to_wire(item), response_id=None, headers=forwarded
+            )
+        except JsonRpcError:
+            return _Outcome()
+        return _Outcome(None, reply.session_id)
+
+    async def _forward_request(
+        self, upstream: Upstream, request: JsonRpcRequest, forwarded: Mapping[str, str]
+    ) -> _Outcome:
+        try:
+            if request.method == Method.TOOLS_CALL:
+                # Validated here so malformed calls never reach the upstream and
+                # so the policy stage can rely on a well-formed tool name.
+                parse_call_tool(request)
+            reply = await self.transport.send(
+                upstream, to_wire(request), response_id=request.id, headers=forwarded
+            )
+        except JsonRpcError as exc:
+            return _Outcome(error_response_from(exc, request.id))
+        return _Outcome(reply.response, reply.session_id)

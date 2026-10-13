@@ -17,6 +17,10 @@ class Settings(BaseSettings):
         default=Path("examples/policy.yaml"),
         description="Path to the YAML policy file.",
     )
+    upstreams_path: Path | None = Field(
+        default=Path("examples/upstreams.yaml"),
+        description="Path to the YAML file listing upstream MCP servers.",
+    )
     host: str = "127.0.0.1"
     port: int = Field(default=8080, ge=1, le=65535)
     log_level: str = "info"
@@ -26,6 +30,9 @@ class Settings(BaseSettings):
     )
     max_json_depth: int = Field(default=64, ge=1, description="Deepest JSON nesting accepted.")
     max_batch_size: int = Field(default=50, ge=1, description="Most messages in one batch.")
+    max_upstream_response_bytes: int = Field(
+        default=10_000_000, ge=1, description="Largest upstream reply accepted, in bytes."
+    )
 
     def parse_limits(self, *, allow_batch: bool = True) -> ParseLimits:
         return ParseLimits(
