@@ -8,9 +8,20 @@ silently widening access.
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 
 class Effect(StrEnum):
@@ -44,12 +55,98 @@ def _validate_patterns(patterns: list[str]) -> list[str]:
     return cleaned
 
 
+JsonScalar = StrictBool | StrictInt | StrictFloat | StrictStr | None
+Number = StrictInt | StrictFloat
+
+_MAX_REGEX_LEN = 500
+_MAX_ONE_OF = 100
+_MAX_MATCHERS = 20
+
+# Operators an argument matcher may use. ``min`` and ``max`` may be combined
+# into a range; every other operator stands alone so a matcher reads as one
+# unambiguous condition.
+_OPERATORS = ("equals", "one_of", "glob", "regex", "present", "max_length", "min", "max")
+
+
+class ArgumentMatcher(BaseModel):
+    """A condition on one ``tools/call`` argument.
+
+    ``path`` addresses a value inside the call's ``arguments`` object with dot
+    notation (``options.mode``); a purely numeric segment indexes into a list
+    (``files.0``). Exactly one operator is given:
+
+    * ``equals`` / ``one_of``: JSON-typed equality (``1`` never equals ``true``);
+    * ``glob`` / ``regex``: string values only; ``regex`` must match the whole value;
+    * ``present``: whether the path resolves at all;
+    * ``max_length``: length of a string, list or object;
+    * ``min`` / ``max``: inclusive numeric bounds (booleans are not numbers).
+
+    A missing value never satisfies an operator other than ``present: false``.
+    ``not: true`` negates the result, so ``{path: env, equals: prod, not: true}``
+    also holds when ``env`` is absent.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    path: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9_$-]+(\.[A-Za-z0-9_$-]+)*$",
+    )
+    equals: JsonScalar = None
+    one_of: list[JsonScalar] | None = Field(default=None, min_length=1, max_length=_MAX_ONE_OF)
+    glob: StrictStr | None = Field(default=None, min_length=1, max_length=_MAX_PATTERN_LEN)
+    regex: StrictStr | None = Field(default=None, min_length=1, max_length=_MAX_REGEX_LEN)
+    present: StrictBool | None = None
+    max_length: StrictInt | None = Field(default=None, ge=0)
+    min: Number | None = None
+    max: Number | None = None
+    negate: StrictBool = Field(default=False, alias="not")
+
+    @property
+    def operators(self) -> tuple[str, ...]:
+        return tuple(op for op in _OPERATORS if op in self.model_fields_set)
+
+    @field_validator("regex")
+    @classmethod
+    def _check_regex(cls, value: str | None) -> str | None:
+        if value is not None:
+            try:
+                re.compile(value)
+            except re.error as exc:
+                raise ValueError(f"invalid regular expression: {exc}") from exc
+        return value
+
+    @model_validator(mode="after")
+    def _one_operator(self) -> ArgumentMatcher:
+        ops = self.operators
+        if not ops:
+            raise ValueError(f"matcher for {self.path!r} needs one of: {', '.join(_OPERATORS)}")
+        if len(ops) > 1 and set(ops) != {"min", "max"}:
+            raise ValueError(
+                f"matcher for {self.path!r} combines {', '.join(ops)}; "
+                "use one operator per matcher (only min and max may be combined)"
+            )
+        for op in ("one_of", "glob", "regex", "present", "max_length"):
+            if op in ops and getattr(self, op) is None:
+                raise ValueError(f"{op} must not be null")
+        if ("min" in ops and self.min is None) or ("max" in ops and self.max is None):
+            raise ValueError("min and max must be numbers")
+        if self.min is not None and self.max is not None and self.min > self.max:
+            raise ValueError(f"min ({self.min}) is greater than max ({self.max})")
+        return self
+
+
 class Rule(BaseModel):
     """A single policy rule.
 
     ``agents``, ``servers`` and ``tools`` are lists of case-sensitive glob
     patterns (``*``, ``?`` and ``[seq]``). A rule matches a request when every
-    one of the three lists has at least one matching pattern.
+    one of the three lists has at least one matching pattern and every entry
+    in ``arguments`` holds for the call's arguments.
+
+    A rule with argument matchers is *conditional*: it can only be decided
+    once the arguments are known, which matters for ``tools/list`` filtering.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -60,11 +157,16 @@ class Rule(BaseModel):
     agents: list[str] = Field(default_factory=lambda: ["*"])
     servers: list[str] = Field(default_factory=lambda: ["*"])
     tools: list[str] = Field(default_factory=lambda: ["*"])
+    arguments: list[ArgumentMatcher] = Field(default_factory=list, max_length=_MAX_MATCHERS)
 
     @field_validator("agents", "servers", "tools")
     @classmethod
     def _check_patterns(cls, value: list[str]) -> list[str]:
         return _validate_patterns(value)
+
+    @property
+    def conditional(self) -> bool:
+        return bool(self.arguments)
 
 
 class Policy(BaseModel):

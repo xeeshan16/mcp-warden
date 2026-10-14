@@ -2,9 +2,10 @@
 
 from mcp_warden.policy.engine import Decision, PolicyEngine, ToolCallRequest
 from mcp_warden.policy.loader import PolicyError, load_policy, load_policy_file, parse_policy
-from mcp_warden.policy.model import Effect, Policy, Rule
+from mcp_warden.policy.model import ArgumentMatcher, Effect, Policy, Rule
 
 __all__ = [
+    "ArgumentMatcher",
     "Decision",
     "Effect",
     "Policy",

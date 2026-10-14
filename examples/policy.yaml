@@ -29,3 +29,41 @@ rules:
     effect: deny
     description: Destructive tools are never allowed through the gateway.
     tools: ["delete_*", "drop_*", "*_delete", "purge_*"]
+
+  # --- Argument matchers -----------------------------------------------------
+  # A rule with `arguments` only applies when every matcher holds for the
+  # tools/call arguments. Operators: equals, one_of, glob, regex (whole value),
+  # present, max_length, min/max. `not: true` negates a matcher, and a missing
+  # argument never satisfies an operator other than `present: false`.
+
+  - id: no-pushes-to-default-branch
+    effect: deny
+    description: Agents never write to the default branch, even with approval.
+    servers: ["github"]
+    tools: ["push_*", "create_or_update_file"]
+    arguments:
+      - {path: branch, one_of: ["main", "master"]}
+
+  - id: demo-basics
+    effect: allow
+    description: Any agent may use the demo server's harmless tools.
+    servers: ["demo"]
+    tools: ["echo", "add", "sleep"]
+
+  - id: short-sleeps-only
+    effect: deny
+    description: Calls that would hold an upstream worker for more than two seconds.
+    servers: ["demo"]
+    tools: ["sleep"]
+    arguments:
+      # Also denies a missing or non-numeric `seconds`: fail closed.
+      - {path: seconds, min: 0, max: 2, not: true}
+
+  - id: support-bot-demo-tickets
+    effect: allow
+    description: The support bot may open demo tickets with a reasonably short title.
+    agents: ["support-bot"]
+    servers: ["demo"]
+    tools: ["create_ticket"]
+    arguments:
+      - {path: title, max_length: 120}

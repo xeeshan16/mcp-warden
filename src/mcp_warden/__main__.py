@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -23,8 +24,18 @@ def _cmd_check(args: argparse.Namespace) -> int:
         f"default {policy.default.value})"
     )
     if args.agent and args.server and args.tool:
+        arguments = None
+        if args.arguments is not None:
+            try:
+                arguments = json.loads(args.arguments)
+            except json.JSONDecodeError as exc:
+                print(f"error: --arguments is not valid JSON: {exc}", file=sys.stderr)
+                return 2
+            if not isinstance(arguments, dict):
+                print("error: --arguments must be a JSON object", file=sys.stderr)
+                return 2
         decision = PolicyEngine(policy).evaluate(
-            ToolCallRequest(args.agent, args.server, args.tool)
+            ToolCallRequest(args.agent, args.server, args.tool, arguments)
         )
         rule = decision.rule_id or "<default>"
         print(
@@ -73,6 +84,9 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--agent")
     check.add_argument("--server")
     check.add_argument("--tool")
+    check.add_argument(
+        "--arguments", help="tool arguments as a JSON object, for rules with argument matchers"
+    )
     check.set_defaults(func=_cmd_check)
 
     serve = sub.add_parser("serve", help="run the gateway HTTP server")

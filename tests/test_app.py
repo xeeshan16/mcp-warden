@@ -28,7 +28,7 @@ def test_policy_summary(client: TestClient) -> None:
     body = client.get("/v1/policy").json()
     assert body["version"] == 1
     assert body["default"] == "deny"
-    assert body["rule_count"] == 4
+    assert body["rule_count"] == 8
     assert "never-destructive" in body["rule_ids"]
 
 
@@ -49,6 +49,22 @@ def test_evaluate(
     body = resp.json()
     assert body["effect"] == effect
     assert body["rule_id"] == rule_id
+
+
+@pytest.mark.parametrize(
+    ("arguments", "effect", "rule_id"),
+    [
+        ({"branch": "main"}, "deny", "no-pushes-to-default-branch"),
+        ({"branch": "feature/x"}, "require_approval", "writes-need-a-human"),
+        (None, "require_approval", "writes-need-a-human"),
+    ],
+)
+def test_evaluate_with_arguments(
+    client: TestClient, arguments: dict[str, str] | None, effect: str, rule_id: str
+) -> None:
+    payload = {"agent": "bot", "server": "github", "tool": "push_files", "arguments": arguments}
+    body = client.post("/v1/policy/evaluate", json=payload).json()
+    assert (body["effect"], body["rule_id"]) == (effect, rule_id)
 
 
 def test_evaluate_rejects_malformed_names(client: TestClient) -> None:

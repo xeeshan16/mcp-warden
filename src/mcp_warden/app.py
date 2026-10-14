@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -24,6 +24,9 @@ class EvaluateRequest(BaseModel):
     agent: str = Field(pattern=_NAME)
     server: str = Field(pattern=_NAME)
     tool: str = Field(pattern=_NAME)
+    arguments: dict[str, Any] | None = Field(
+        default=None, description="Tool arguments, for rules with argument matchers."
+    )
 
 
 class EvaluateResponse(BaseModel):
@@ -138,7 +141,9 @@ def create_app(
     @app.post("/v1/policy/evaluate", response_model=EvaluateResponse, tags=["policy"])
     def evaluate(body: EvaluateRequest, engine: EngineDep) -> EvaluateResponse:
         """Dry-run a decision without calling any upstream server."""
-        decision = engine.evaluate(ToolCallRequest(body.agent, body.server, body.tool))
+        decision = engine.evaluate(
+            ToolCallRequest(body.agent, body.server, body.tool, body.arguments)
+        )
         return EvaluateResponse(
             effect=decision.effect.value,
             rule_id=decision.rule_id,

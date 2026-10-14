@@ -28,3 +28,18 @@ def test_check_invalid_policy(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     bad.write_text("version: 9\n", encoding="utf-8")
     assert main(["check", str(bad)]) == 1
     assert "error:" in capsys.readouterr().err
+
+
+def test_check_dry_run_with_arguments(capsys: pytest.CaptureFixture[str]) -> None:
+    base = ["check", str(EXAMPLE), "--agent", "bot", "--server", "demo", "--tool", "sleep"]
+    assert main([*base, "--arguments", '{"seconds": 1}']) == 0
+    assert "allow: bot -> demo/sleep (rule demo-basics" in capsys.readouterr().out
+    assert main([*base, "--arguments", '{"seconds": 30}']) == 0
+    assert "deny: bot -> demo/sleep (rule short-sleeps-only" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("raw", ["{nope", "[1, 2]"])
+def test_check_rejects_bad_arguments(raw: str, capsys: pytest.CaptureFixture[str]) -> None:
+    argv = ["check", str(EXAMPLE), "--agent", "a", "--server", "s", "--tool", "t"]
+    assert main([*argv, "--arguments", raw]) == 2
+    assert "--arguments" in capsys.readouterr().err
