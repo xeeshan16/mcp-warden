@@ -3,11 +3,15 @@
 Responsibilities, in order:
 
 1. resolve the upstream by name (unknown servers never reach the network);
-2. parse the payload with the hardened parser; batches are accepted only when
+2. identify the agent (see :mod:`mcp_warden.proxy.enforcement`);
+3. parse the payload with the hardened parser; batches are accepted only when
    the client declared an MCP revision that still allowed them;
-3. handle each message: requests are forwarded and answered, notifications and
-   client responses are forwarded and acknowledged with ``202``;
-4. map every upstream failure onto a JSON-RPC error carrying the request id.
+4. handle each message: ``tools/call`` is checked against the policy before
+   it is forwarded, ``tools/list`` results are filtered on the way back, other
+   requests are forwarded and answered, notifications and client responses
+   are forwarded and acknowledged with ``202``;
+5. map every refusal and upstream failure onto a JSON-RPC error carrying the
+   request id.
 
 Batch entries are forwarded one by one (concurrently) rather than as a batch.
 That keeps per-call checks — policy, rate limits, budgets from the following
@@ -33,6 +37,7 @@ from mcp_warden.jsonrpc import (
     JsonRpcError,
     JsonRpcErrorResponse,
     JsonRpcRequest,
+    JsonRpcSuccess,
     ParsedItem,
     ParseLimits,
     error_response,
@@ -48,6 +53,7 @@ from mcp_warden.proxy.client import (
     UpstreamSessionNotFoundError,
     UpstreamTransport,
 )
+from mcp_warden.proxy.enforcement import PolicyGuard, agent_from_headers
 from mcp_warden.upstreams import Upstream, UpstreamRegistry
 
 FORWARDED_HEADERS: tuple[str, ...] = (SESSION_HEADER, PROTOCOL_HEADER)
@@ -78,10 +84,12 @@ class ProxyService:
         self,
         registry: UpstreamRegistry,
         transport: UpstreamTransport,
+        guard: PolicyGuard,
         limits: ParseLimits | None = None,
     ) -> None:
         self.registry = registry
         self.transport = transport
+        self.guard = guard
         self.limits = limits or ParseLimits()
 
     async def handle(self, server: str, body: bytes, headers: Mapping[str, str]) -> ProxyResult:
@@ -91,6 +99,11 @@ class ProxyService:
                 None, ErrorCode.INVALID_REQUEST, "unknown server", {"server": server}
             )
             return ProxyResult(404, to_wire(err))
+
+        try:
+            agent = agent_from_headers(headers)
+        except JsonRpcError as exc:
+            return ProxyResult(400, to_wire(error_response_from(exc, None)))
 
         forwarded = forwarded_headers(headers)
         limits = replace(self.limits, allow_batch=batching_allowed(forwarded.get(PROTOCOL_HEADER)))
@@ -105,7 +118,7 @@ class ProxyService:
 
         try:
             outcomes = await asyncio.gather(
-                *(self._handle_item(upstream, item, forwarded) for item in parsed.items)
+                *(self._handle_item(agent, upstream, item, forwarded) for item in parsed.items)
             )
         except UpstreamSessionNotFoundError:
             # MCP: a 404 for a session id tells the client to re-initialise.
@@ -122,12 +135,12 @@ class ProxyService:
         return ProxyResult(200, responses if parsed.is_batch else responses[0], out_headers)
 
     async def _handle_item(
-        self, upstream: Upstream, item: ParsedItem, forwarded: Mapping[str, str]
+        self, agent: str, upstream: Upstream, item: ParsedItem, forwarded: Mapping[str, str]
     ) -> _Outcome:
         if isinstance(item, InvalidMessage):
             return _Outcome(item.error)
         if isinstance(item, JsonRpcRequest):
-            return await self._forward_request(upstream, item, forwarded)
+            return await self._forward_request(agent, upstream, item, forwarded)
         # Notifications and the agent's responses to server-initiated requests
         # have nobody to report a failure to, so failures end here.
         try:
@@ -139,16 +152,23 @@ class ProxyService:
         return _Outcome(None, reply.session_id)
 
     async def _forward_request(
-        self, upstream: Upstream, request: JsonRpcRequest, forwarded: Mapping[str, str]
+        self,
+        agent: str,
+        upstream: Upstream,
+        request: JsonRpcRequest,
+        forwarded: Mapping[str, str],
     ) -> _Outcome:
         try:
             if request.method == Method.TOOLS_CALL:
-                # Validated here so malformed calls never reach the upstream and
-                # so the policy stage can rely on a well-formed tool name.
-                parse_call_tool(request)
+                # Validated first so malformed calls never reach the upstream and
+                # the policy sees a well-formed tool name and arguments object.
+                self.guard.check_call(agent, upstream.name, parse_call_tool(request))
             reply = await self.transport.send(
                 upstream, to_wire(request), response_id=request.id, headers=forwarded
             )
+            response = reply.response
+            if request.method == Method.TOOLS_LIST and isinstance(response, JsonRpcSuccess):
+                response = self.guard.filter_tools(agent, upstream.name, response)
         except JsonRpcError as exc:
             return _Outcome(error_response_from(exc, request.id))
-        return _Outcome(reply.response, reply.session_id)
+        return _Outcome(response, reply.session_id)

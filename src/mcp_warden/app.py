@@ -14,7 +14,13 @@ from mcp_warden import __version__
 from mcp_warden.config import Settings
 from mcp_warden.jsonrpc import ErrorCode, error_response, to_wire
 from mcp_warden.policy import PolicyEngine, ToolCallRequest, load_policy_file
-from mcp_warden.proxy import HttpUpstreamClient, ProxyResult, ProxyService, UpstreamTransport
+from mcp_warden.proxy import (
+    HttpUpstreamClient,
+    PolicyGuard,
+    ProxyResult,
+    ProxyService,
+    UpstreamTransport,
+)
 from mcp_warden.upstreams import UpstreamRegistry, load_upstreams_file
 
 _NAME = r"^[A-Za-z0-9_.:/-]{1,200}$"
@@ -110,7 +116,7 @@ def create_app(
         max_response_bytes=settings.max_upstream_response_bytes,
         max_json_depth=settings.max_json_depth,
     )
-    proxy = ProxyService(upstreams, transport, settings.parse_limits())
+    proxy = ProxyService(upstreams, transport, PolicyGuard(engine), settings.parse_limits())
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:

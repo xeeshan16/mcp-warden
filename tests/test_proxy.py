@@ -3,66 +3,24 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from pathlib import Path
-from typing import Any
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from gateway_helpers import EXAMPLE_POLICY, initialize, make_client, rpc
 from mcp_warden.app import create_app
 from mcp_warden.config import Settings
-from mcp_warden.fake_upstream import TOOLS, create_fake_upstream
+from mcp_warden.fake_upstream import TOOLS
 from mcp_warden.jsonrpc import ErrorCode
 from mcp_warden.proxy import HttpUpstreamClient
 from mcp_warden.upstreams import Upstream, UpstreamRegistry
-
-EXAMPLE_POLICY = Path(__file__).resolve().parents[1] / "examples" / "policy.yaml"
-
-INIT = {
-    "jsonrpc": "2.0",
-    "id": 0,
-    "method": "initialize",
-    "params": {
-        "protocolVersion": "2025-11-25",
-        "capabilities": {},
-        "clientInfo": {"name": "test-agent", "version": "1"},
-    },
-}
-
-
-def make_client(*, sse: bool = False, timeout: float = 2.0, **settings: Any) -> TestClient:
-    fake = create_fake_upstream(sse=sse)
-    transport = HttpUpstreamClient(httpx.AsyncClient(transport=httpx.ASGITransport(app=fake)))
-    registry = UpstreamRegistry([Upstream("demo", "http://upstream.test/mcp", timeout, 1.0, {})])
-    app = create_app(
-        Settings(policy_path=EXAMPLE_POLICY, upstreams_path=None, **settings),
-        upstreams=registry,
-        transport=transport,
-    )
-    return TestClient(app)
 
 
 @pytest.fixture(params=[False, True], ids=["json", "sse"])
 def client(request: pytest.FixtureRequest) -> Iterator[TestClient]:
     with make_client(sse=request.param) as c:
         yield c
-
-
-def initialize(client: TestClient) -> dict[str, str]:
-    resp = client.post("/mcp/demo", json=INIT)
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["id"] == 0
-    assert body["result"]["serverInfo"]["name"] == "mcp-warden-fake-upstream"
-    return {"mcp-session-id": resp.headers["mcp-session-id"], "mcp-protocol-version": "2025-11-25"}
-
-
-def rpc(request_id: Any, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    msg: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
-    if params is not None:
-        msg["params"] = params
-    return msg
 
 
 def test_full_session(client: TestClient) -> None:
