@@ -90,3 +90,37 @@ JSON and SSE upstreams. Also verified by hand with both servers running under uv
 **Next (day 4):** policy enforcement in the proxy: check `tools/call` against the policy,
 filter `tools/list` responses, add argument constraints to rules, and return denials as
 JSON-RPC errors. Agent identity is a placeholder header until day 5.
+
+## Day 4 — 2026-10-14: policy enforcement in the proxy
+
+**Done**
+
+- Argument matchers on rules (`mcp_warden.policy.model.ArgumentMatcher`): dotted paths
+  into the `tools/call` arguments (numeric segments index lists) with `equals`,
+  `one_of`, `glob`, `regex` (full match), `present`, `max_length` and `min`/`max`, plus
+  `not` to negate. JSON-typed equality (`1` never equals `true`), a missing value never
+  satisfies anything but `present: false`, one operator per matcher (only `min`+`max`
+  combine), and bad regexes or inverted ranges fail at load time.
+- `PolicyEngine.always_denied()`: listing-time visibility that treats conditional rules
+  as "might match", so a conditional deny never hides a tool and a conditional allow
+  keeps one visible.
+- `mcp_warden.proxy.enforcement.PolicyGuard`: `tools/call` is evaluated before
+  forwarding; `deny` → `-32001` and `require_approval` → `-32002`, both carrying server,
+  tool, effect, rule id and reason, and neither reaches the upstream. `tools/list`
+  results are filtered with every other member preserved; an unreadable result fails
+  closed with `-32005`. Batch entries are checked independently.
+- Placeholder agent identity from `X-Warden-Agent` (missing → `anonymous`, malformed →
+  `400`), replaced by API keys tomorrow.
+- Dry runs take arguments: `mcp-warden check --arguments '{...}'` and an `arguments`
+  field on `POST /v1/policy/evaluate`.
+- Example policy: protected default branch, demo-server rules, bounded `sleep`, and a
+  support-bot rule with a title-length limit.
+
+**Tests:** 270 passing locally (91 new), 97% line coverage; ruff, ruff format, strict
+mypy and `uv build` clean. New end-to-end tests run the example policy against the fake
+upstream over JSON and SSE. Also verified by hand with both servers under uvicorn (output
+in the README): the two denied calls never reached the fake upstream.
+
+**Next (day 5):** agent identity: per-agent API keys (prefix + SHA-256 hash at rest,
+constant-time compare), SQLAlchemy models, Alembic migrations, key issue/revoke service,
+replacing the `X-Warden-Agent` placeholder.

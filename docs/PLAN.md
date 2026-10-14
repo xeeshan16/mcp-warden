@@ -52,3 +52,8 @@ composes them as a pipeline so a stage can short-circuit with a JSON-RPC error.
   `DELETE` session teardown and relaying of server-to-client messages on a POST's SSE
   stream are answered with `405` or dropped for now; relaying them is picked up on
   day 13 (hardening) if time allows.
+- 2026-10-14: day 4 done as planned. Argument constraints are expressed as per-rule
+  `arguments` matchers. Only `tools/call` and `tools/list` are policed; `resources/*` and
+  `prompts/*` are still forwarded unchecked and are added to day 13 (hardening). Whether
+  denial details (rule id and description) are shown to agents may become a setting with
+  the admin API on day 10.

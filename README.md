@@ -6,7 +6,7 @@
 **A self-hosted policy, budget and audit gateway for AI agent tool calls over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).**
 
-> Status: under active development (day 3 of a 14-day build). See
+> Status: under active development (day 4 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md)
 > for the daily log. Features marked _planned_ are not implemented yet.
 
@@ -39,9 +39,9 @@ with a policy file you can review in a pull request.
 | Upstream registry; upstream credentials resolved from env vars, never sent by agents | ✅ day 3 |
 | Upstream timeouts, size caps and error mapping to JSON-RPC errors | ✅ day 3 |
 | Deterministic fake MCP server for tests and demos (`mcp-warden fake-upstream`) | ✅ day 3 |
-| Policy enforcement on `tools/call` and `tools/list` filtering in the proxy | _planned_ |
+| Policy enforcement on `tools/call` and `tools/list` filtering in the proxy | ✅ day 4 |
+| Argument matchers on tool calls (equals, one_of, glob, regex, present, max_length, min/max) | ✅ day 4 |
 | Per-agent API keys (hashed at rest) | _planned_ |
-| Argument constraints on tool calls | _planned_ |
 | Rate limits (token bucket per agent and tool) | _planned_ |
 | Call and token budgets per time window | _planned_ |
 | Human approval queue for risky tools | _planned_ |
@@ -67,9 +67,10 @@ flowchart LR
     W -.-> M[Prometheus / OTel]
 ```
 
-So far the policy engine (day 1), the JSON-RPC / MCP message layer (day 2) and the
-proxy path to upstream servers (day 3) are in place. Policy enforcement inside the proxy
-and the stages after it land over the following days (see the plan).
+So far the policy engine (day 1), the JSON-RPC / MCP message layer (day 2), the proxy
+path to upstream servers (day 3) and policy enforcement inside the proxy (day 4) are in
+place. Agent authentication, rate limits, budgets, approvals and the audit log land over
+the following days (see the plan).
 
 ### Policy resolution
 
@@ -97,6 +98,42 @@ rules:
 
 Unknown keys, duplicate rule ids, empty pattern lists and unsupported versions are
 rejected at load time, so a typo fails loudly instead of silently widening access.
+
+#### Argument matchers
+
+A rule can also look at the `tools/call` arguments. It then applies only when every
+matcher holds:
+
+```yaml
+  - id: no-pushes-to-default-branch
+    effect: deny
+    servers: ["github"]
+    tools: ["push_*", "create_or_update_file"]
+    arguments:
+      - {path: branch, one_of: ["main", "master"]}
+
+  - id: short-sleeps-only
+    effect: deny
+    servers: ["demo"]
+    tools: ["sleep"]
+    arguments:
+      - {path: seconds, min: 0, max: 2, not: true}   # also denies a missing value
+```
+
+| Operator | Holds when the value at `path` … |
+| --- | --- |
+| `equals` / `one_of` | equals the given JSON value(s); typed, so `1` never equals `true` |
+| `glob` / `regex` | is a string matching the glob, or fully matching the regex |
+| `present` | resolves (`true`) or does not resolve (`false`) |
+| `max_length` | is a string, list or object of at most that length |
+| `min` / `max` | is a number within the inclusive bounds (may be combined) |
+
+`path` uses dot notation (`options.mode`, `files.0`). A missing value never satisfies an
+operator other than `present: false`, and `not: true` negates the result, so a negated
+deny fails closed. Each matcher takes exactly one operator; invalid regexes and inverted
+ranges are rejected at load time. Globs are plain string matching, not path
+normalisation: to fence a file path, prefer a `regex` and a deny rule for `..`.
+Regexes come from the policy author, who is trusted; keep them simple.
 
 ### Parsing untrusted JSON-RPC
 
@@ -145,6 +182,28 @@ which names an environment variable read at startup. A missing variable stops st
 When an upstream answers `404` for a session id, the 404 is passed through so the client
 starts a new session, as MCP specifies. Batch entries are forwarded one by one, so later
 per-call checks apply the same way whether or not calls were batched.
+
+### Enforcing the policy
+
+Inside the proxy, each `tools/call` is validated and then evaluated with the agent, the
+upstream name, the tool name and its arguments **before** anything is forwarded:
+
+- `deny` → error `-32001` with the deciding rule; the upstream never sees the call;
+- `require_approval` → error `-32002` (parking the call for a human arrives on day 8);
+- `allow` → forwarded.
+
+`tools/list` replies are filtered so an agent is only shown tools it could ever call.
+A tool is hidden when an unconditional `deny` applies, or when no rule could permit it
+and the default is `deny`. Rules with argument matchers keep a tool visible, since the
+arguments are only known at call time (the call itself is still checked). Everything
+else in the result (the pagination cursor, `_meta`, each tool's schema and annotations)
+is forwarded untouched, and a `tools/list` result the gateway cannot read is refused
+with `-32005` instead of being passed through unfiltered. Batch entries are checked one
+by one.
+
+Until per-agent API keys land on day 5, the agent id is taken from the `X-Warden-Agent`
+header (missing means `anonymous`). That header is only as trustworthy as the network in
+front of the gateway, so do not expose this build beyond a trusted network.
 
 Not yet proxied: the optional `GET` stream for server-initiated messages and `DELETE`
 session teardown (both answered with `405`, which MCP allows), and server-to-client
@@ -200,6 +259,44 @@ mcp-session-id: fake-session-1
 
 With the fake upstream stopped, the same call returns
 `{"jsonrpc":"2.0","id":3,"error":{"code":-32005,"message":"upstream unreachable","data":{"server":"demo"}}}`.
+
+The example policy applies to that session too. Output from a local run with the same
+two servers (the session id from `initialize` in `mcp-session-id`; error bodies were
+pretty-printed and are wrapped here for width):
+
+```text
+$ tools/list (no X-Warden-Agent header, so agent "anonymous")
+['echo', 'add', 'get_forecast', 'sleep']
+$ tools/list with X-Warden-Agent: support-bot
+['echo', 'add', 'get_forecast', 'create_ticket', 'sleep']
+
+$ tools/call delete_records {"table": "users"} as support-bot
+{"jsonrpc": "2.0", "id": 2, "error": {"code": -32001,
+  "message": "tool call denied by policy: delete_records",
+  "data": {"server": "demo", "tool": "delete_records", "effect": "deny",
+           "rule_id": "never-destructive",
+           "reason": "Destructive tools are never allowed through the gateway."}}}
+
+$ tools/call sleep {"seconds": 30}
+{"jsonrpc": "2.0", "id": 3, "error": {"code": -32001,
+  "message": "tool call denied by policy: sleep",
+  "data": {"server": "demo", "tool": "sleep", "effect": "deny",
+           "rule_id": "short-sleeps-only",
+           "reason": "Calls that would hold an upstream worker for more than two seconds."}}}
+
+$ tools/call sleep {"seconds": 1}
+{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"slept 1s"}],"isError":false}}
+```
+
+The fake upstream's log showed four requests (`initialize`, two `tools/list`, one
+`sleep`): the two denied calls never left the gateway.
+
+Dry-run a call with arguments without any upstream:
+
+```bash
+uv run mcp-warden check examples/policy.yaml \
+  --agent bot --server demo --tool sleep --arguments '{"seconds": 30}'
+```
 
 Configuration is read from `WARDEN_*` environment variables (`WARDEN_POLICY_PATH`,
 `WARDEN_UPSTREAMS_PATH`, `WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`, the parser
