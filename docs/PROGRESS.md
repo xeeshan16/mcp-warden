@@ -124,3 +124,46 @@ in the README): the two denied calls never reached the fake upstream.
 **Next (day 5):** agent identity: per-agent API keys (prefix + SHA-256 hash at rest,
 constant-time compare), SQLAlchemy models, Alembic migrations, key issue/revoke service,
 replacing the `X-Warden-Agent` placeholder.
+
+## Day 5 — 2026-10-15: agent identity
+
+**Done**
+
+- `mcp_warden.db`: SQLAlchemy 2 models for `agents` and `api_keys` with a fixed
+  constraint naming convention, timezone-aware UTC timestamps stored as naive UTC (same
+  behaviour on SQLite and PostgreSQL), SQLite foreign keys switched on so
+  `ON DELETE CASCADE` works, and an engine factory (in-memory SQLite shares one
+  connection; other databases get `pool_pre_ping`).
+- Alembic migrations shipped inside the package (revision `0001`), applied with
+  `mcp-warden db upgrade` and no `alembic.ini` needed at runtime. The gateway refuses to
+  start unless the schema is at the head revision. `alembic.ini` in the repo is only for
+  authoring new revisions. A test diffs the migrated schema against the models.
+- `mcp_warden.identity.keys`: `mcpw_<12 hex prefix>_<32-byte secret>` keys, SHA-256 of
+  the full key at rest, `hmac.compare_digest`, a dummy comparison for unknown prefixes,
+  and reprs that never include the plaintext.
+- `mcp_warden.identity.store.IdentityStore`: create/list/disable agents, issue keys
+  (label, optional expiry), list and revoke keys (revoking twice keeps the first
+  timestamp), and `authenticate()`, which returns `None` for every failure (malformed,
+  unknown, wrong secret, revoked, expired, agent disabled). `last_used_at` is written at
+  most once a minute per key. Injected clock for tests.
+- `mcp_warden.identity.auth`: `ApiKeyAuthenticator` (Bearer token, store call in a worker
+  thread) and `TrustedHeaderAuthenticator` (the old `X-Warden-Agent` behaviour, now opt-in
+  via `WARDEN_AUTH_MODE=trusted-header`). Failures are `401` with JSON-RPC `-32008` and
+  `WWW-Authenticate: Bearer realm="mcp-warden"`.
+- The proxy authenticates before resolving the server, so unauthenticated callers cannot
+  probe which upstreams exist; the agent's key is never forwarded upstream.
+- CLI: `mcp-warden db upgrade`, `agents create|list|disable|enable`,
+  `keys issue|list|revoke` (the key is printed once on stdout, details on stderr).
+- New settings `WARDEN_DATABASE_URL` and `WARDEN_AUTH_MODE`; `psycopg[binary]` available
+  as the `postgres` extra.
+
+**Tests:** 334 passing locally (64 new), 98% line coverage; ruff, ruff format, strict
+mypy and `uv build` clean, and the wheel contains the migration scripts. New end-to-end
+tests run the gateway in API key mode against the fake upstream: missing and invalid
+keys, identity taken from the key (a spoofed `X-Warden-Agent` is ignored), immediate
+revocation, and no `Authorization` header on the upstream leg. Also verified by hand
+with both servers under uvicorn and a fresh SQLite file (output in the README).
+
+**Next (day 6):** rate limiting: token buckets per agent and per agent+tool with an
+injected clock, in-memory and database-backed stores, `-32003` errors with retry
+information.

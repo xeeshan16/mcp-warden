@@ -57,3 +57,8 @@ composes them as a pipeline so a stage can short-circuit with a JSON-RPC error.
   `prompts/*` are still forwarded unchecked and are added to day 13 (hardening). Whether
   denial details (rule id and description) are shown to agents may become a setting with
   the admin API on day 10.
+- 2026-10-15: day 5 done as planned. The `X-Warden-Agent` placeholder stays available as
+  an explicit `trusted-header` auth mode for development and tests; API keys are the
+  default. Agents and keys are managed from the CLI for now; the admin HTTP API for them
+  is part of day 10. The policy dry-run and summary endpoints are still unauthenticated
+  until admin auth lands on day 10.

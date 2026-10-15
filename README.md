@@ -41,7 +41,9 @@ with a policy file you can review in a pull request.
 | Deterministic fake MCP server for tests and demos (`mcp-warden fake-upstream`) | ✅ day 3 |
 | Policy enforcement on `tools/call` and `tools/list` filtering in the proxy | ✅ day 4 |
 | Argument matchers on tool calls (equals, one_of, glob, regex, present, max_length, min/max) | ✅ day 4 |
-| Per-agent API keys (hashed at rest) | _planned_ |
+| Per-agent API keys: SHA-256 at rest, constant-time compare, expiry, revocation | ✅ day 5 |
+| SQLAlchemy models and Alembic migrations (SQLite for dev, PostgreSQL driver extra) | ✅ day 5 |
+| `mcp-warden db` / `agents` / `keys` commands to manage identities | ✅ day 5 |
 | Rate limits (token bucket per agent and tool) | _planned_ |
 | Call and token budgets per time window | _planned_ |
 | Human approval queue for risky tools | _planned_ |
@@ -68,9 +70,9 @@ flowchart LR
 ```
 
 So far the policy engine (day 1), the JSON-RPC / MCP message layer (day 2), the proxy
-path to upstream servers (day 3) and policy enforcement inside the proxy (day 4) are in
-place. Agent authentication, rate limits, budgets, approvals and the audit log land over
-the following days (see the plan).
+path to upstream servers (day 3), policy enforcement inside the proxy (day 4) and agent
+authentication with API keys (day 5) are in place. Rate limits, budgets, approvals and
+the audit log land over the following days (see the plan).
 
 ### Policy resolution
 
@@ -201,9 +203,36 @@ is forwarded untouched, and a `tools/list` result the gateway cannot read is ref
 with `-32005` instead of being passed through unfiltered. Batch entries are checked one
 by one.
 
-Until per-agent API keys land on day 5, the agent id is taken from the `X-Warden-Agent`
-header (missing means `anonymous`). That header is only as trustworthy as the network in
-front of the gateway, so do not expose this build beyond a trusted network.
+### Agent identity
+
+Every request to `/mcp/{server}` is authenticated first; until it is, the gateway does
+not even reveal whether the server exists. Agents send a per-agent API key as
+`Authorization: Bearer mcpw_<prefix>_<secret>`:
+
+- `prefix` is 12 random hex characters stored in clear, used to find the key and to
+  identify it in listings; `secret` is 32 random bytes (URL-safe base64).
+- Only `sha256(key)` is stored. The secret has 256 bits of entropy, so a slow password
+  hash would add latency without adding protection. Digests are compared with
+  `hmac.compare_digest`, and an unknown prefix costs the same hashing work as a wrong
+  secret.
+- Keys can expire, be revoked, or stop working because their agent is disabled. All of
+  these fail with the same `401` and JSON-RPC error `-32008` plus
+  `WWW-Authenticate: Bearer realm="mcp-warden"`, so a caller learns nothing about which
+  keys or agents exist. Revocation takes effect on the next request.
+- `last_used_at` is updated at most once a minute per key, so busy agents do not turn
+  every call into a database write.
+- The resolved agent name is what the policy is evaluated against. The agent's key is
+  never forwarded to an upstream.
+
+Agents and keys live in the database (`WARDEN_DATABASE_URL`; SQLite by default,
+PostgreSQL via `uv sync --extra postgres` and a `postgresql+psycopg://` URL). Schema
+changes are Alembic migrations shipped inside the package; `mcp-warden db upgrade`
+applies them, and the gateway refuses to start on a database that is not at the latest
+revision instead of failing on the first request.
+
+For local development the gateway can instead trust an `X-Warden-Agent` header
+(`WARDEN_AUTH_MODE=trusted-header`; missing means `anonymous`). That header is only as
+trustworthy as whatever sets it, so use this mode only behind an authenticating proxy.
 
 Not yet proxied: the optional `GET` stream for server-initiated messages and `DELETE`
 session teardown (both answered with `405`, which MCP allows), and server-to-client
@@ -222,6 +251,9 @@ uv sync
 uv run mcp-warden check examples/policy.yaml \
   --agent ci-bot --server github --tool delete_repo
 
+# Create the identity database (SQLite at ./mcp-warden.db unless WARDEN_DATABASE_URL is set)
+uv run mcp-warden db upgrade
+
 # Dry-run a decision over HTTP
 uv run mcp-warden serve --policy examples/policy.yaml
 curl -s localhost:8080/v1/policy/evaluate \
@@ -229,7 +261,50 @@ curl -s localhost:8080/v1/policy/evaluate \
   -d '{"agent":"ci-bot","server":"github","tool":"create_pull_request"}'
 ```
 
+### Register an agent and issue it a key
+
+```bash
+uv run mcp-warden agents create support-bot --description "Answers support tickets"
+uv run mcp-warden keys issue support-bot --label laptop --expires-in-days 30
+# prints the key once on stdout; store it, e.g. export WARDEN_KEY=mcpw_...
+uv run mcp-warden keys list support-bot
+uv run mcp-warden keys revoke <prefix>
+```
+
+Output from a local run against a fresh SQLite database, with the fake upstream and the
+gateway running as below (the key's secret part is elided here):
+
+```text
+$ mcp-warden serve            # before the migration
+error: database schema is at an empty database, expected 0001; run `mcp-warden db upgrade`
+$ mcp-warden db upgrade
+database at revision 0001
+$ mcp-warden agents create support-bot --description "Answers support tickets"
+created agent support-bot
+$ mcp-warden keys issue support-bot --label laptop --expires-in-days 30
+mcpw_a02556cf1df0_…
+issued key a02556cf1df0 for support-bot (expires 2026-11-14T09:58:13Z). It is shown only once; store it now.
+
+$ tools/list without a key
+HTTP/1.1 401 Unauthorized
+www-authenticate: Bearer realm="mcp-warden"
+{"jsonrpc":"2.0","id":null,"error":{"code":-32008,"message":"missing bearer API key"}}
+$ tools/list with the support-bot key
+['echo', 'add', 'get_forecast', 'create_ticket', 'sleep']
+
+$ mcp-warden keys revoke a02556cf1df0
+revoked key a02556cf1df0 of support-bot at 2026-10-15T09:58:17Z
+$ tools/list with the revoked key
+{"jsonrpc":"2.0","id":null,"error":{"code":-32008,"message":"invalid, expired or revoked API key"}}
+$ mcp-warden keys list support-bot
+a02556cf1df0	revoked	created 2026-10-15T09:58:13Z	expires 2026-11-14T09:58:13Z	last used 2026-10-15T09:58:16Z	laptop
+```
+
 ### Proxy a session to the fake MCP server
+
+The requests below authenticate with a key from the previous step. The outputs further
+down were captured before API keys were added, when the agent came from the
+`X-Warden-Agent` header (today's `WARDEN_AUTH_MODE=trusted-header`).
 
 ```bash
 # Terminal 1: the deterministic fake upstream (add --sse to answer with event streams)
@@ -239,10 +314,12 @@ uv run mcp-warden fake-upstream --port 9001
 uv run mcp-warden serve
 
 # Terminal 3: an MCP session through the gateway
-curl -si localhost:8080/mcp/demo -H 'content-type: application/json' -d \
+curl -si localhost:8080/mcp/demo -H 'content-type: application/json' \
+  -H "authorization: Bearer $WARDEN_KEY" -d \
   '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
 # copy the mcp-session-id response header, then:
 curl -s localhost:8080/mcp/demo -H 'content-type: application/json' \
+  -H "authorization: Bearer $WARDEN_KEY" \
   -H 'mcp-session-id: fake-session-1' -H 'mcp-protocol-version: 2025-11-25' -d \
   '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_forecast","arguments":{"city":"Lahore"}}}'
 ```
@@ -299,7 +376,8 @@ uv run mcp-warden check examples/policy.yaml \
 ```
 
 Configuration is read from `WARDEN_*` environment variables (`WARDEN_POLICY_PATH`,
-`WARDEN_UPSTREAMS_PATH`, `WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`, the parser
+`WARDEN_UPSTREAMS_PATH`, `WARDEN_DATABASE_URL`, `WARDEN_AUTH_MODE` (`api-key` or
+`trusted-header`), `WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`, the parser
 limits `WARDEN_MAX_MESSAGE_BYTES`, `WARDEN_MAX_JSON_DEPTH`, `WARDEN_MAX_BATCH_SIZE`, and
 `WARDEN_MAX_UPSTREAM_RESPONSE_BYTES`).
 
@@ -309,7 +387,13 @@ limits `WARDEN_MAX_MESSAGE_BYTES`, `WARDEN_MAX_JSON_DEPTH`, `WARDEN_MAX_BATCH_SI
 uv run ruff check . && uv run ruff format --check .
 uv run mypy
 uv run pytest --cov=mcp_warden
+
+# New migration after changing the models (uses WARDEN_DATABASE_URL)
+uv run mcp-warden db upgrade && uv run alembic revision --autogenerate -m "describe change"
 ```
+
+A test compares the migrated schema with the SQLAlchemy models, so a model change
+without a migration fails CI.
 
 CI runs the same lint, type-check, test and build steps on every push.
 
