@@ -14,3 +14,5 @@ htmlcov/
 CLAUDE.md
 AGENTS.md
 .claude/
+*.db
+*.db-journal

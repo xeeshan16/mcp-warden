@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
 from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from mcp_warden.jsonrpc.parser import ParseLimits
+
+
+class AuthMode(StrEnum):
+    # Per-agent API keys checked against the database (the default).
+    API_KEY = "api-key"
+    # Trust ``X-Warden-Agent`` as set by an authenticating proxy in front of
+    # the gateway. For local development and tests only.
+    TRUSTED_HEADER = "trusted-header"
 
 
 class Settings(BaseSettings):
@@ -21,6 +30,11 @@ class Settings(BaseSettings):
         default=Path("examples/upstreams.yaml"),
         description="Path to the YAML file listing upstream MCP servers.",
     )
+    database_url: str = Field(
+        default="sqlite:///./mcp-warden.db",
+        description="SQLAlchemy URL, e.g. postgresql+psycopg://user:pass@host/db.",
+    )
+    auth_mode: AuthMode = Field(default=AuthMode.API_KEY, description="How agents are identified.")
     host: str = "127.0.0.1"
     port: int = Field(default=8080, ge=1, le=65535)
     log_level: str = "info"

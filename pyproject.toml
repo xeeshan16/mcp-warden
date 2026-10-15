@@ -7,16 +7,24 @@ license = "MIT"
 authors = [{ name = "Zeeshan Imdad" }]
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.13",
+    "anyio>=4.4",
     "fastapi>=0.115",
     "httpx>=0.27",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "pyyaml>=6.0",
+    "sqlalchemy>=2.0",
     "uvicorn>=0.30",
 ]
 
 [project.scripts]
 mcp-warden = "mcp_warden.__main__:main"
+
+[project.optional-dependencies]
+postgres = [
+    "psycopg[binary]>=3.2",
+]
 
 [dependency-groups]
 dev = [
