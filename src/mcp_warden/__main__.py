@@ -1,4 +1,8 @@
-"""Command-line entry point: ``mcp-warden serve``, ``check`` and ``fake-upstream``."""
+"""Command-line entry point.
+
+``serve``, ``check`` and ``fake-upstream`` run the gateway and its tools;
+``db``, ``agents`` and ``keys`` manage the identity database.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +10,12 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from mcp_warden.config import Settings
+from mcp_warden.db import DatabaseNotReadyError
+from mcp_warden.identity import IdentityError, IdentityStore
 from mcp_warden.policy import PolicyEngine, PolicyError, ToolCallRequest, load_policy_file
 from mcp_warden.upstreams import UpstreamError
 
@@ -58,7 +65,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     settings = Settings(**overrides)  # type: ignore[arg-type]
     try:
         app = create_app(settings)
-    except (PolicyError, UpstreamError) as exc:
+    except (PolicyError, UpstreamError, DatabaseNotReadyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     uvicorn.run(app, host=settings.host, port=settings.port, log_level=settings.log_level)
@@ -73,6 +80,156 @@ def _cmd_fake_upstream(args: argparse.Namespace) -> int:
     app = create_fake_upstream(sse=args.sse)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
+
+
+def _database_url(args: argparse.Namespace) -> str:
+    url: str = args.database_url or Settings().database_url
+    return url
+
+
+def _cmd_db_upgrade(args: argparse.Namespace) -> int:
+    from mcp_warden.db import make_engine, upgrade
+    from mcp_warden.db.migrate import current_revision
+
+    engine = make_engine(_database_url(args))
+    try:
+        upgrade(engine)
+        print(f"database at revision {current_revision(engine)}")
+    finally:
+        engine.dispose()
+    return 0
+
+
+def _with_store(args: argparse.Namespace, action: str) -> int:
+    from mcp_warden.db import ensure_schema_current, make_engine, make_sessionmaker
+
+    engine = make_engine(_database_url(args))
+    try:
+        ensure_schema_current(engine)
+        store = IdentityStore(make_sessionmaker(engine))
+        return _IDENTITY_ACTIONS[action](store, args)
+    except (DatabaseNotReadyError, IdentityError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+
+def _fmt(ts: datetime | None) -> str:
+    return ts.strftime("%Y-%m-%dT%H:%M:%SZ") if ts is not None else "-"
+
+
+def _agents_create(store: IdentityStore, args: argparse.Namespace) -> int:
+    agent = store.create_agent(args.name, args.description)
+    print(f"created agent {agent.name}")
+    return 0
+
+
+def _agents_list(store: IdentityStore, args: argparse.Namespace) -> int:
+    for agent in store.list_agents():
+        state = "disabled" if agent.disabled else "enabled"
+        print(f"{agent.name}\t{state}\t{_fmt(agent.created_at)}\t{agent.description}")
+    return 0
+
+
+def _agents_disable(store: IdentityStore, args: argparse.Namespace) -> int:
+    store.set_disabled(args.name, True)
+    print(f"disabled agent {args.name}; its keys stop working immediately")
+    return 0
+
+
+def _agents_enable(store: IdentityStore, args: argparse.Namespace) -> int:
+    store.set_disabled(args.name, False)
+    print(f"enabled agent {args.name}")
+    return 0
+
+
+def _keys_issue(store: IdentityStore, args: argparse.Namespace) -> int:
+    expires_in = timedelta(days=args.expires_in_days) if args.expires_in_days else None
+    issued = store.issue_key(args.agent, args.label, expires_in)
+    print(issued.plaintext)
+    print(
+        f"issued key {issued.info.prefix} for {issued.info.agent} "
+        f"(expires {_fmt(issued.info.expires_at)}). It is shown only once; store it now.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _keys_list(store: IdentityStore, args: argparse.Namespace) -> int:
+    now = datetime.now().astimezone()
+    for key in store.list_keys(args.agent):
+        print(
+            f"{key.prefix}\t{key.status(now)}\tcreated {_fmt(key.created_at)}\t"
+            f"expires {_fmt(key.expires_at)}\tlast used {_fmt(key.last_used_at)}\t{key.label}"
+        )
+    return 0
+
+
+def _keys_revoke(store: IdentityStore, args: argparse.Namespace) -> int:
+    key = store.revoke_key(args.prefix)
+    print(f"revoked key {key.prefix} of {key.agent} at {_fmt(key.revoked_at)}")
+    return 0
+
+
+_IDENTITY_ACTIONS = {
+    "agents-create": _agents_create,
+    "agents-list": _agents_list,
+    "agents-disable": _agents_disable,
+    "agents-enable": _agents_enable,
+    "keys-issue": _keys_issue,
+    "keys-list": _keys_list,
+    "keys-revoke": _keys_revoke,
+}
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
+def _add_identity_commands(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    db_url = argparse.ArgumentParser(add_help=False)
+    db_url.add_argument(
+        "--database-url", help="SQLAlchemy URL (default: WARDEN_DATABASE_URL or local SQLite)"
+    )
+
+    def identity(parser: argparse.ArgumentParser, action: str) -> None:
+        parser.set_defaults(func=lambda args: _with_store(args, action))
+
+    db = sub.add_parser("db", help="manage the database schema")
+    db_sub = db.add_subparsers(dest="db_command", required=True)
+    db_sub.add_parser(
+        "upgrade", parents=[db_url], help="apply migrations up to the latest revision"
+    ).set_defaults(func=_cmd_db_upgrade)
+
+    agents = sub.add_parser("agents", help="manage agents")
+    agents_sub = agents.add_subparsers(dest="agents_command", required=True)
+    create = agents_sub.add_parser("create", parents=[db_url], help="register an agent")
+    create.add_argument("name")
+    create.add_argument("--description", default="")
+    identity(create, "agents-create")
+    identity(agents_sub.add_parser("list", parents=[db_url], help="list agents"), "agents-list")
+    for verb in ("disable", "enable"):
+        p = agents_sub.add_parser(verb, parents=[db_url], help=f"{verb} an agent")
+        p.add_argument("name")
+        identity(p, f"agents-{verb}")
+
+    keys = sub.add_parser("keys", help="manage agent API keys")
+    keys_sub = keys.add_subparsers(dest="keys_command", required=True)
+    issue = keys_sub.add_parser("issue", parents=[db_url], help="issue a key for an agent")
+    issue.add_argument("agent")
+    issue.add_argument("--label", default="")
+    issue.add_argument("--expires-in-days", type=_positive_int, default=None)
+    identity(issue, "keys-issue")
+    listing = keys_sub.add_parser("list", parents=[db_url], help="list an agent's keys")
+    listing.add_argument("agent")
+    identity(listing, "keys-list")
+    revoke = keys_sub.add_parser("revoke", parents=[db_url], help="revoke a key by prefix")
+    revoke.add_argument("prefix")
+    identity(revoke, "keys-revoke")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -101,6 +258,8 @@ def build_parser() -> argparse.ArgumentParser:
     fake.add_argument("--port", type=int, default=9001)
     fake.add_argument("--sse", action="store_true", help="answer with text/event-stream")
     fake.set_defaults(func=_cmd_fake_upstream)
+
+    _add_identity_commands(sub)
     return parser
 
 

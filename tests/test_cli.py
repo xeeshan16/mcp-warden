@@ -43,3 +43,51 @@ def test_check_rejects_bad_arguments(raw: str, capsys: pytest.CaptureFixture[str
     argv = ["check", str(EXAMPLE), "--agent", "a", "--server", "s", "--tool", "t"]
     assert main([*argv, "--arguments", raw]) == 2
     assert "--arguments" in capsys.readouterr().err
+
+
+def test_identity_commands_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    url = ["--database-url", f"sqlite:///{tmp_path / 'cli.db'}"]
+    assert main(["agents", "list", *url]) == 1
+    assert "mcp-warden db upgrade" in capsys.readouterr().err
+
+    assert main(["db", "upgrade", *url]) == 0
+    assert "database at revision 0001" in capsys.readouterr().out
+
+    assert main(["agents", "create", "support-bot", "--description", "tickets", *url]) == 0
+    assert main(["agents", "create", "support-bot", *url]) == 1
+    assert "already exists" in capsys.readouterr().err
+
+    assert (
+        main(["keys", "issue", "support-bot", "--label", "ci", "--expires-in-days", "30", *url])
+        == 0
+    )
+    captured = capsys.readouterr()
+    key = captured.out.strip()
+    assert key.startswith("mcpw_")
+    prefix = key.split("_")[1]
+    assert f"issued key {prefix}" in captured.err
+    assert "shown only once" in captured.err
+
+    assert main(["keys", "list", "support-bot", *url]) == 0
+    listing = capsys.readouterr().out
+    assert prefix in listing
+    assert "active" in listing
+    assert key not in listing
+
+    assert main(["keys", "revoke", prefix, *url]) == 0
+    assert f"revoked key {prefix} of support-bot" in capsys.readouterr().out
+    assert main(["keys", "list", "support-bot", *url]) == 0
+    assert "revoked" in capsys.readouterr().out
+
+    assert main(["agents", "disable", "support-bot", *url]) == 0
+    assert main(["agents", "list", *url]) == 0
+    assert "support-bot\tdisabled" in capsys.readouterr().out
+    assert main(["agents", "enable", "support-bot", *url]) == 0
+
+    assert main(["keys", "issue", "ghost", *url]) == 1
+    assert "no such agent" in capsys.readouterr().err
+
+
+def test_expiry_must_be_positive(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        main(["keys", "issue", "bot", "--expires-in-days", "0"])
