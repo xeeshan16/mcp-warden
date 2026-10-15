@@ -2,8 +2,9 @@
 
 Responsibilities, in order:
 
-1. resolve the upstream by name (unknown servers never reach the network);
-2. identify the agent (see :mod:`mcp_warden.proxy.enforcement`);
+1. authenticate the agent (see :mod:`mcp_warden.identity`); nothing else,
+   not even whether a server exists, is revealed to an unauthenticated caller;
+2. resolve the upstream by name (unknown servers never reach the network);
 3. parse the payload with the hardened parser; batches are accepted only when
    the client declared an MCP revision that still allowed them;
 4. handle each message: ``tools/call`` is checked against the policy before
@@ -31,6 +32,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from mcp_warden.identity import AuthenticationError, Authenticator
 from mcp_warden.jsonrpc import (
     ErrorCode,
     InvalidMessage,
@@ -53,7 +55,7 @@ from mcp_warden.proxy.client import (
     UpstreamSessionNotFoundError,
     UpstreamTransport,
 )
-from mcp_warden.proxy.enforcement import PolicyGuard, agent_from_headers
+from mcp_warden.proxy.enforcement import PolicyGuard
 from mcp_warden.upstreams import Upstream, UpstreamRegistry
 
 FORWARDED_HEADERS: tuple[str, ...] = (SESSION_HEADER, PROTOCOL_HEADER)
@@ -85,25 +87,27 @@ class ProxyService:
         registry: UpstreamRegistry,
         transport: UpstreamTransport,
         guard: PolicyGuard,
+        authenticator: Authenticator,
         limits: ParseLimits | None = None,
     ) -> None:
+        self.authenticator = authenticator
         self.registry = registry
         self.transport = transport
         self.guard = guard
         self.limits = limits or ParseLimits()
 
     async def handle(self, server: str, body: bytes, headers: Mapping[str, str]) -> ProxyResult:
+        try:
+            agent = await self.authenticator.authenticate(headers)
+        except AuthenticationError as exc:
+            return ProxyResult(exc.status, to_wire(error_response_from(exc, None)), exc.headers)
+
         upstream = self.registry.get(server)
         if upstream is None:
             err = error_response(
                 None, ErrorCode.INVALID_REQUEST, "unknown server", {"server": server}
             )
             return ProxyResult(404, to_wire(err))
-
-        try:
-            agent = agent_from_headers(headers)
-        except JsonRpcError as exc:
-            return ProxyResult(400, to_wire(error_response_from(exc, None)))
 
         forwarded = forwarded_headers(headers)
         limits = replace(self.limits, allow_batch=batching_allowed(forwarded.get(PROTOCOL_HEADER)))

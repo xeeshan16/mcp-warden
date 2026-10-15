@@ -14,40 +14,17 @@ Two points in a session carry policy-relevant information:
 A ``tools/list`` result the gateway cannot read is refused rather than
 forwarded unfiltered: failing closed is the only safe choice for a filter.
 
-Agent identity is read from the ``X-Warden-Agent`` header for now. It is a
-placeholder that per-agent API keys replace; until then it is only as
-trustworthy as the network in front of the gateway.
+The agent a decision is made for is the one :mod:`mcp_warden.identity`
+authenticated for the request.
 """
 
 from __future__ import annotations
 
-import re
-from collections.abc import Mapping
 from typing import Any
 
 from mcp_warden.jsonrpc import ErrorCode, JsonRpcError, JsonRpcSuccess, success_response
 from mcp_warden.jsonrpc.mcp import CallToolParams, parse_list_tools_result
 from mcp_warden.policy import Decision, Effect, PolicyEngine, ToolCallRequest
-
-AGENT_HEADER = "x-warden-agent"
-ANONYMOUS_AGENT = "anonymous"
-_AGENT_ID = re.compile(r"^[A-Za-z0-9_.:@-]{1,100}$")
-
-
-def agent_from_headers(headers: Mapping[str, str]) -> str:
-    """Return the calling agent's id, or raise ``INVALID_REQUEST``.
-
-    A missing header means ``anonymous``, which policies can target like any
-    other agent (and which the default ``deny`` covers).
-    """
-    lowered = {k.lower(): v for k, v in headers.items()}
-    raw = lowered.get(AGENT_HEADER)
-    if raw is None:
-        return ANONYMOUS_AGENT
-    agent = raw.strip()
-    if not _AGENT_ID.fullmatch(agent):
-        raise JsonRpcError(ErrorCode.INVALID_REQUEST, f"invalid {AGENT_HEADER} header")
-    return agent
 
 
 def _decision_data(decision: Decision, server: str, tool: str) -> dict[str, Any]:

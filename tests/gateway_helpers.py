@@ -9,7 +9,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from mcp_warden.app import create_app
-from mcp_warden.config import Settings
+from mcp_warden.config import AuthMode, Settings
 from mcp_warden.fake_upstream import create_fake_upstream
 from mcp_warden.policy import Effect, Policy, PolicyEngine
 from mcp_warden.proxy import HttpUpstreamClient
@@ -46,7 +46,12 @@ def make_client(
     transport = HttpUpstreamClient(httpx.AsyncClient(transport=httpx.ASGITransport(app=fake)))
     registry = UpstreamRegistry([Upstream("demo", "http://upstream.test/mcp", timeout, 1.0, {})])
     app = create_app(
-        Settings(policy_path=EXAMPLE_POLICY, upstreams_path=None, **settings),
+        Settings(
+            policy_path=EXAMPLE_POLICY,
+            upstreams_path=None,
+            auth_mode=AuthMode.TRUSTED_HEADER,
+            **settings,
+        ),
         engine=engine or allow_all(),
         upstreams=registry,
         transport=transport,

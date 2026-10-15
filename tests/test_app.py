@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from mcp_warden import __version__
 from mcp_warden.app import create_app
-from mcp_warden.config import Settings
+from mcp_warden.config import AuthMode, Settings
 from mcp_warden.policy import PolicyError
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "policy.yaml"
@@ -15,7 +15,7 @@ EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "policy.yaml"
 
 @pytest.fixture
 def client() -> TestClient:
-    return TestClient(create_app(Settings(policy_path=EXAMPLE)))
+    return TestClient(create_app(Settings(policy_path=EXAMPLE, auth_mode=AuthMode.TRUSTED_HEADER)))
 
 
 def test_healthz(client: TestClient) -> None:
@@ -78,4 +78,4 @@ def test_broken_policy_fails_at_startup(tmp_path: Path) -> None:
     bad = tmp_path / "bad.yaml"
     bad.write_text("version: 1\nrules:\n  - id: a\n    effect: nope\n", encoding="utf-8")
     with pytest.raises(PolicyError):
-        create_app(Settings(policy_path=bad))
+        create_app(Settings(policy_path=bad, auth_mode=AuthMode.TRUSTED_HEADER))

@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from gateway_helpers import EXAMPLE_POLICY, initialize, make_client, rpc
 from mcp_warden.app import create_app
-from mcp_warden.config import Settings
+from mcp_warden.config import AuthMode, Settings
 from mcp_warden.jsonrpc import ErrorCode
 from mcp_warden.policy import PolicyEngine, load_policy_file
 from mcp_warden.proxy import HttpUpstreamClient
@@ -149,7 +149,9 @@ def _gateway_with_upstream_reply(result: Any, calls: list[str]) -> TestClient:
     transport = HttpUpstreamClient(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     registry = UpstreamRegistry([Upstream("demo", "http://upstream.test/mcp", 2.0, 1.0, {})])
     app = create_app(
-        Settings(policy_path=EXAMPLE_POLICY, upstreams_path=None),
+        Settings(
+            policy_path=EXAMPLE_POLICY, upstreams_path=None, auth_mode=AuthMode.TRUSTED_HEADER
+        ),
         upstreams=registry,
         transport=transport,
     )
@@ -192,7 +194,9 @@ def test_approval_required_is_its_own_error() -> None:
 
     transport = HttpUpstreamClient(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     app = create_app(
-        Settings(policy_path=EXAMPLE_POLICY, upstreams_path=None),
+        Settings(
+            policy_path=EXAMPLE_POLICY, upstreams_path=None, auth_mode=AuthMode.TRUSTED_HEADER
+        ),
         upstreams=registry,
         transport=transport,
     )

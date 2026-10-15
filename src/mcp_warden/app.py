@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
@@ -11,7 +12,14 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from mcp_warden import __version__
-from mcp_warden.config import Settings
+from mcp_warden.config import AuthMode, Settings
+from mcp_warden.db import ensure_schema_current, make_engine, make_sessionmaker
+from mcp_warden.identity import (
+    ApiKeyAuthenticator,
+    Authenticator,
+    IdentityStore,
+    TrustedHeaderAuthenticator,
+)
 from mcp_warden.jsonrpc import ErrorCode, error_response, to_wire
 from mcp_warden.policy import PolicyEngine, ToolCallRequest, load_policy_file
 from mcp_warden.proxy import (
@@ -22,6 +30,8 @@ from mcp_warden.proxy import (
     UpstreamTransport,
 )
 from mcp_warden.upstreams import UpstreamRegistry, load_upstreams_file
+
+logger = logging.getLogger(__name__)
 
 _NAME = r"^[A-Za-z0-9_.:/-]{1,200}$"
 
@@ -97,12 +107,14 @@ def create_app(
     engine: PolicyEngine | None = None,
     upstreams: UpstreamRegistry | None = None,
     transport: UpstreamTransport | None = None,
+    authenticator: Authenticator | None = None,
 ) -> FastAPI:
     """Build the FastAPI app.
 
-    The policy and the upstream registry are loaded eagerly so that a broken
-    file (or a missing upstream credential) stops startup instead of surfacing
-    on the first request.
+    The policy, the upstream registry and (in API key mode) the database
+    schema are checked eagerly so that a broken file, a missing upstream
+    credential or a forgotten migration stops startup instead of surfacing on
+    the first request.
     """
     settings = settings or Settings()
     engine = engine or PolicyEngine(load_policy_file(settings.policy_path))
@@ -116,7 +128,25 @@ def create_app(
         max_response_bytes=settings.max_upstream_response_bytes,
         max_json_depth=settings.max_json_depth,
     )
-    proxy = ProxyService(upstreams, transport, PolicyGuard(engine), settings.parse_limits())
+    db_engine = None
+    if authenticator is None:
+        if settings.auth_mode is AuthMode.TRUSTED_HEADER:
+            logger.warning(
+                "auth mode %s: agent identity is taken from X-Warden-Agent unchecked",
+                settings.auth_mode.value,
+            )
+            authenticator = TrustedHeaderAuthenticator()
+        else:
+            db_engine = make_engine(settings.database_url)
+            try:
+                ensure_schema_current(db_engine)
+            except Exception:
+                db_engine.dispose()
+                raise
+            authenticator = ApiKeyAuthenticator(IdentityStore(make_sessionmaker(db_engine)))
+    proxy = ProxyService(
+        upstreams, transport, PolicyGuard(engine), authenticator, settings.parse_limits()
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -124,6 +154,8 @@ def create_app(
             yield
         finally:
             await transport.aclose()
+            if db_engine is not None:
+                db_engine.dispose()
 
     app = FastAPI(title="MCP Warden", version=__version__, lifespan=lifespan)
     app.state.settings = settings
