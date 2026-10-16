@@ -167,3 +167,46 @@ with both servers under uvicorn and a fresh SQLite file (output in the README).
 **Next (day 6):** rate limiting: token buckets per agent and per agent+tool with an
 injected clock, in-memory and database-backed stores, `-32003` errors with retry
 information.
+
+## Day 6 — 2026-10-16: rate limiting
+
+**Done**
+
+- `rate_limits` section in the policy (`mcp_warden.policy.model.RateLimit`): agent /
+  server / tool globs, `requests` per `second|minute|hour|day`, optional `burst` (bucket
+  size, defaults to `requests`), and `scope: agent` (one bucket per agent) or
+  `scope: tool` (per agent, server and tool). Strict validation (integers only, no
+  booleans, unknown keys rejected, unique ids). `PolicyEngine.rate_limits_for()`
+  returns the limits that apply to a call.
+- `mcp_warden.ratelimit.bucket`: storage-free token-bucket arithmetic. Levels are derived
+  from the last recorded level and time (no timers), a clock going backwards adds
+  nothing, and acquisition is all-or-nothing across a call's buckets with the longest
+  wait reported as `retry_after`.
+- `InMemoryBucketStore`: injected monotonic clock, a lock, and bounded memory (refilled
+  buckets swept, then least recently used evicted past 100,000).
+- `DatabaseBucketStore` and Alembic revision `0002` (`rate_limit_buckets`): one short
+  transaction per call, `SELECT ... FOR UPDATE` in digest order, writes only when
+  allowed, SHA-256 keys, one retry when a concurrent caller inserts the same row first,
+  `full_at` index and `prune()` for refilled buckets. Wall-clock epoch seconds so
+  several hosts agree.
+- `RateLimiter` in the proxy: checked after the policy (denied calls spend nothing),
+  `-32003` with the limit's details and `retry_after` in whole seconds, plus a
+  `Retry-After` header on single (non-batch) responses that only the gateway's own
+  refusals set. Batch entries take tokens independently.
+- `WARDEN_RATE_LIMIT_STORE=memory|database`; the database store works in either auth
+  mode and the gateway refuses to start if the schema is behind.
+- `mcp-warden check` and `GET /v1/policy` show rate limits; the example policy has three.
+- CI: a PostgreSQL 16 service and `WARDEN_TEST_POSTGRES_URL`, so the database store
+  tests also run against PostgreSQL (brought forward from day 13).
+
+**Tests:** 388 passing locally on SQLite (54 new) with 10 PostgreSQL variants skipped;
+398 passing with a local PostgreSQL 16, 98% line coverage. ruff, ruff format, strict
+mypy and `uv build` clean. The PostgreSQL concurrency test (8 threads, 4 store
+instances, one 10-token bucket, exactly 10 calls pass) was checked to fail with the row
+lock removed (57 passed instead of 10). Verified by hand with both servers under uvicorn
+and the database store on PostgreSQL (output in the README): the fourth ticket in a
+minute got `-32003` and `Retry-After: 20` and never reached the fake upstream.
+
+**Next (day 7):** budgets: call and token budgets per agent per window, a
+`TokenEstimator` interface with a deterministic estimator, a usage ledger, and
+`-32004` budget-exhausted errors.

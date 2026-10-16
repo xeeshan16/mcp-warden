@@ -6,7 +6,7 @@
 **A self-hosted policy, budget and audit gateway for AI agent tool calls over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).**
 
-> Status: under active development (day 4 of a 14-day build). See
+> Status: under active development (day 6 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md)
 > for the daily log. Features marked _planned_ are not implemented yet.
 
@@ -44,7 +44,8 @@ with a policy file you can review in a pull request.
 | Per-agent API keys: SHA-256 at rest, constant-time compare, expiry, revocation | ✅ day 5 |
 | SQLAlchemy models and Alembic migrations (SQLite for dev, PostgreSQL driver extra) | ✅ day 5 |
 | `mcp-warden db` / `agents` / `keys` commands to manage identities | ✅ day 5 |
-| Rate limits (token bucket per agent and tool) | _planned_ |
+| Rate limits in the policy: token buckets per agent or per agent and tool, `Retry-After` | ✅ day 6 |
+| Rate-limit state in memory or shared through the database (row-locked on PostgreSQL) | ✅ day 6 |
 | Call and token budgets per time window | _planned_ |
 | Human approval queue for risky tools | _planned_ |
 | Metadata-only audit log (no payloads stored) | _planned_ |
@@ -70,9 +71,9 @@ flowchart LR
 ```
 
 So far the policy engine (day 1), the JSON-RPC / MCP message layer (day 2), the proxy
-path to upstream servers (day 3), policy enforcement inside the proxy (day 4) and agent
-authentication with API keys (day 5) are in place. Rate limits, budgets, approvals and
-the audit log land over the following days (see the plan).
+path to upstream servers (day 3), policy enforcement inside the proxy (day 4), agent
+authentication with API keys (day 5) and rate limits (day 6) are in place. Budgets,
+approvals and the audit log land over the following days (see the plan).
 
 ### Policy resolution
 
@@ -202,6 +203,59 @@ else in the result (the pagination cursor, `_meta`, each tool's schema and annot
 is forwarded untouched, and a `tools/list` result the gateway cannot read is refused
 with `-32005` instead of being passed through unfiltered. Batch entries are checked one
 by one.
+
+### Rate limits
+
+Rate limits are declared next to the rules in the policy file, so they are reviewed the
+same way:
+
+```yaml
+rate_limits:
+  - id: per-agent              # every call, one bucket per agent
+    requests: 120
+    per: minute                # second | minute | hour | day
+    burst: 30                  # bucket size; defaults to `requests`
+
+  - id: source-control-writes
+    servers: ["github"]
+    tools: ["create_*", "update_*", "merge_*", "push_*"]
+    scope: tool                # one bucket per agent, server and tool
+    requests: 20
+    per: hour
+    burst: 5
+```
+
+Each limit is a token bucket: it holds up to `burst` tokens and refills continuously at
+`requests / per`. A `tools/call` needs one token from **every** limit that matches it
+(by agent, server and tool glob), so adding a limit can only make things stricter.
+
+- Limits are checked **after** the policy rules: a denied call never spends a token.
+- Taking tokens is all-or-nothing across a call's buckets, so a refused call drains
+  nothing and tokens are never lost to a call that did not happen.
+- A refused call gets JSON-RPC error `-32003` with the limit, its numbers and
+  `retry_after` (whole seconds until every bucket involved has a token, rounded up).
+  For a single request the gateway also sets a `Retry-After` header; the HTTP status
+  stays `200` because MCP clients act on the JSON-RPC error. Only the gateway's own
+  refusals set the header, never an upstream's error.
+- Each entry of a (pre-2025-06-18) batch takes its own token.
+- `tools/list`, `initialize` and notifications are not limited.
+
+Where the buckets live is a deployment choice (`WARDEN_RATE_LIMIT_STORE`):
+
+- `memory` (default): in-process, exact, per gateway instance. Memory is bounded:
+  buckets that have refilled are dropped, and past 100,000 buckets the least recently
+  used go first.
+- `database`: one row per bucket below capacity in `rate_limit_buckets`, shared by every
+  gateway using the database. Each call is one short transaction that locks its rows
+  with `SELECT ... FOR UPDATE` in a fixed key order (no deadlocks), derives the current
+  levels and writes only when the call is allowed. Keys are stored as SHA-256 digests;
+  rows of refilled buckets can be pruned. A test runs 8 threads through 4 separate store
+  instances against one PostgreSQL bucket of 10 tokens and checks that exactly 10 calls
+  pass (with the row lock removed, it fails). On SQLite, calls are serialised inside the
+  process, so use PostgreSQL for more than one instance.
+
+Buckets are keyed by the limit's `id`: changing a limit's numbers keeps the current
+levels (clamped to the new size), renaming it starts afresh.
 
 ### Agent identity
 
@@ -368,6 +422,43 @@ $ tools/call sleep {"seconds": 1}
 The fake upstream's log showed four requests (`initialize`, two `tools/list`, one
 `sleep`): the two denied calls never left the gateway.
 
+### See a rate limit trip
+
+With the example policy, `support-bot` may create three demo tickets a minute. Output
+from a local run with both servers as above, a support-bot key in `$WARDEN_KEY`,
+`WARDEN_RATE_LIMIT_STORE=database` and a local PostgreSQL in `WARDEN_DATABASE_URL`
+(response bodies trimmed to the lines shown):
+
+```text
+$ mcp-warden db upgrade
+database at revision 0002
+$ mcp-warden check examples/policy.yaml --agent support-bot --server demo --tool create_ticket
+ok: examples/policy.yaml (version 1, 8 rules, 3 rate limits, default deny)
+deny: support-bot -> demo/create_ticket (rule <default>: no rule matched; default is deny)
+rate limit per-agent: 120/minute, burst 30, per agent
+rate limit demo-tickets: 3/minute, burst 3, per tool
+
+$ tools/call create_ticket #1 .. #3   (each with a title)
+HTTP/1.1 200 OK
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"created ticket T-542B6222"}],"isError":false}}
+...
+$ tools/call create_ticket #4
+HTTP/1.1 200 OK
+retry-after: 20
+{"jsonrpc":"2.0","id":4,"error":{"code":-32003,"message":"rate limit exceeded: demo-tickets","data":{"server":"demo","tool":"create_ticket","limit_id":"demo-tickets","scope":"tool","requests":3,"per":"minute","burst":3,"retry_after":20}}}
+
+$ psql -c "select tokens, full_at - updated_at as seconds_to_full from rate_limit_buckets"
+ tokens | seconds_to_full
+--------+-----------------
+  0.002 |            60.0
+ 27.080 |             1.5
+```
+
+(The dry run says `deny` because the support-bot ticket rule has an argument matcher on
+`title` and the dry run had no arguments; the real calls carried a title.) The fake
+upstream logged four requests, `initialize` and the three allowed calls; the fourth
+call never left the gateway.
+
 Dry-run a call with arguments without any upstream:
 
 ```bash
@@ -377,7 +468,7 @@ uv run mcp-warden check examples/policy.yaml \
 
 Configuration is read from `WARDEN_*` environment variables (`WARDEN_POLICY_PATH`,
 `WARDEN_UPSTREAMS_PATH`, `WARDEN_DATABASE_URL`, `WARDEN_AUTH_MODE` (`api-key` or
-`trusted-header`), `WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`, the parser
+`trusted-header`), `WARDEN_RATE_LIMIT_STORE` (`memory` or `database`), `WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`, the parser
 limits `WARDEN_MAX_MESSAGE_BYTES`, `WARDEN_MAX_JSON_DEPTH`, `WARDEN_MAX_BATCH_SIZE`, and
 `WARDEN_MAX_UPSTREAM_RESPONSE_BYTES`).
 
@@ -395,7 +486,14 @@ uv run mcp-warden db upgrade && uv run alembic revision --autogenerate -m "descr
 A test compares the migrated schema with the SQLAlchemy models, so a model change
 without a migration fails CI.
 
-CI runs the same lint, type-check, test and build steps on every push.
+The database tests run on SQLite by default. Point `WARDEN_TEST_POSTGRES_URL` at a
+throwaway PostgreSQL database (e.g.
+`postgresql+psycopg://warden:warden@localhost:5432/warden_test`, after
+`uv sync --extra postgres`) to also run them against PostgreSQL, including the
+concurrency test for shared rate limits.
+
+CI runs the same lint, type-check, test and build steps on every push, with a
+PostgreSQL 16 service so the PostgreSQL variants run too.
 
 ## License
 

@@ -62,3 +62,9 @@ composes them as a pipeline so a stage can short-circuit with a JSON-RPC error.
   default. Agents and keys are managed from the CLI for now; the admin HTTP API for them
   is part of day 10. The policy dry-run and summary endpoints are still unauthenticated
   until admin auth lands on day 10.
+- 2026-10-16: day 6 done as planned. Rate limits are declared in the policy file
+  (`rate_limits`) rather than in separate configuration, so they are reviewed with the
+  rules. Only `tools/call` is limited. A PostgreSQL service was added to CI today because
+  the shared bucket store needs row-lock tests; day 13 keeps the remaining PostgreSQL
+  integration work. Pruning refilled database buckets is a method for now and is wired
+  into the retention job on day 9.
