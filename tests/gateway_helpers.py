@@ -13,6 +13,7 @@ from mcp_warden.config import AuthMode, Settings
 from mcp_warden.fake_upstream import create_fake_upstream
 from mcp_warden.policy import Effect, Policy, PolicyEngine
 from mcp_warden.proxy import HttpUpstreamClient
+from mcp_warden.ratelimit import BucketStore
 from mcp_warden.upstreams import Upstream, UpstreamRegistry
 
 EXAMPLE_POLICY = Path(__file__).resolve().parents[1] / "examples" / "policy.yaml"
@@ -38,6 +39,7 @@ def make_client(
     sse: bool = False,
     timeout: float = 2.0,
     engine: PolicyEngine | None = None,
+    bucket_store: BucketStore | None = None,
     **settings: Any,
 ) -> TestClient:
     """Gateway in front of the fake upstream; the policy allows everything
@@ -55,6 +57,7 @@ def make_client(
         engine=engine or allow_all(),
         upstreams=registry,
         transport=transport,
+        bucket_store=bucket_store,
     )
     return TestClient(app)
 

@@ -19,6 +19,13 @@ class AuthMode(StrEnum):
     TRUSTED_HEADER = "trusted-header"
 
 
+class RateLimitStore(StrEnum):
+    # Buckets in process memory: exact, but per gateway instance.
+    MEMORY = "memory"
+    # Buckets in the database: shared by every instance using it.
+    DATABASE = "database"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="WARDEN_", env_file=".env", extra="ignore")
 
@@ -35,6 +42,10 @@ class Settings(BaseSettings):
         description="SQLAlchemy URL, e.g. postgresql+psycopg://user:pass@host/db.",
     )
     auth_mode: AuthMode = Field(default=AuthMode.API_KEY, description="How agents are identified.")
+    rate_limit_store: RateLimitStore = Field(
+        default=RateLimitStore.MEMORY,
+        description="Where token buckets for the policy's rate_limits are kept.",
+    )
     host: str = "127.0.0.1"
     port: int = Field(default=8080, ge=1, le=65535)
     log_level: str = "info"

@@ -49,3 +49,21 @@ def clock() -> FakeClock:
 @pytest.fixture
 def store(db_engine: Engine, clock: FakeClock) -> IdentityStore:
     return IdentityStore(make_sessionmaker(db_engine), clock=clock)
+
+
+class FakeMonotonic:
+    """A seconds clock for the rate limiter, moved by hand."""
+
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def seconds() -> FakeMonotonic:
+    return FakeMonotonic()

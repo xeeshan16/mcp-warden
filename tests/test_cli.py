@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from mcp_warden.__main__ import main
+from mcp_warden.db.migrate import head_revision
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "policy.yaml"
 
@@ -51,7 +52,7 @@ def test_identity_commands_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixt
     assert "mcp-warden db upgrade" in capsys.readouterr().err
 
     assert main(["db", "upgrade", *url]) == 0
-    assert "database at revision 0001" in capsys.readouterr().out
+    assert f"database at revision {head_revision()}" in capsys.readouterr().out
 
     assert main(["agents", "create", "support-bot", "--description", "tickets", *url]) == 0
     assert main(["agents", "create", "support-bot", *url]) == 1

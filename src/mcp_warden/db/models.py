@@ -1,9 +1,13 @@
-"""Tables for agent identity.
+"""Tables for agent identity and shared rate-limit state.
 
 ``agents`` holds the identities policies refer to; ``api_keys`` holds the
 credentials an agent presents. A key row never contains the key itself, only
 its public prefix (for lookup and display) and the SHA-256 digest of the full
 key (see :mod:`mcp_warden.identity.keys`).
+
+``rate_limit_buckets`` holds token buckets below capacity for the database
+rate-limit store (see :mod:`mcp_warden.ratelimit.database`); its times are
+epoch seconds because they feed arithmetic, not display.
 
 Timestamps are timezone-aware UTC in Python. They are stored as naive UTC so
 that SQLite (which has no timezone type) and PostgreSQL behave the same.
@@ -16,6 +20,7 @@ from datetime import UTC, datetime
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     MetaData,
@@ -85,3 +90,14 @@ class ApiKey(Base):
     last_used_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     agent: Mapped[Agent] = relationship(back_populates="keys")
+
+
+class RateLimitBucket(Base):
+    __tablename__ = "rate_limit_buckets"
+
+    # SHA-256 hex digest of the bucket key (limit id, agent, server, tool).
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tokens: Mapped[float] = mapped_column(Float)
+    updated_at: Mapped[float] = mapped_column(Float)
+    # When the bucket is full again; past that the row can be deleted.
+    full_at: Mapped[float] = mapped_column(Float, index=True)

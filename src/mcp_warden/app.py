@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from mcp_warden import __version__
-from mcp_warden.config import AuthMode, Settings
+from mcp_warden.config import AuthMode, RateLimitStore, Settings
 from mcp_warden.db import ensure_schema_current, make_engine, make_sessionmaker
 from mcp_warden.identity import (
     ApiKeyAuthenticator,
@@ -28,6 +28,12 @@ from mcp_warden.proxy import (
     ProxyResult,
     ProxyService,
     UpstreamTransport,
+)
+from mcp_warden.ratelimit import (
+    BucketStore,
+    DatabaseBucketStore,
+    InMemoryBucketStore,
+    RateLimiter,
 )
 from mcp_warden.upstreams import UpstreamRegistry, load_upstreams_file
 
@@ -57,6 +63,7 @@ class PolicySummary(BaseModel):
     default: str
     rule_count: int
     rule_ids: list[str]
+    rate_limit_ids: list[str]
 
 
 def get_engine(request: Request) -> PolicyEngine:
@@ -108,6 +115,7 @@ def create_app(
     upstreams: UpstreamRegistry | None = None,
     transport: UpstreamTransport | None = None,
     authenticator: Authenticator | None = None,
+    bucket_store: BucketStore | None = None,
 ) -> FastAPI:
     """Build the FastAPI app.
 
@@ -129,23 +137,36 @@ def create_app(
         max_json_depth=settings.max_json_depth,
     )
     db_engine = None
+    if (authenticator is None and settings.auth_mode is AuthMode.API_KEY) or (
+        bucket_store is None and settings.rate_limit_store is RateLimitStore.DATABASE
+    ):
+        db_engine = make_engine(settings.database_url)
+        try:
+            ensure_schema_current(db_engine)
+        except Exception:
+            db_engine.dispose()
+            raise
     if authenticator is None:
-        if settings.auth_mode is AuthMode.TRUSTED_HEADER:
+        if settings.auth_mode is AuthMode.TRUSTED_HEADER or db_engine is None:
             logger.warning(
                 "auth mode %s: agent identity is taken from X-Warden-Agent unchecked",
                 settings.auth_mode.value,
             )
             authenticator = TrustedHeaderAuthenticator()
         else:
-            db_engine = make_engine(settings.database_url)
-            try:
-                ensure_schema_current(db_engine)
-            except Exception:
-                db_engine.dispose()
-                raise
             authenticator = ApiKeyAuthenticator(IdentityStore(make_sessionmaker(db_engine)))
+    if bucket_store is None:
+        if settings.rate_limit_store is RateLimitStore.DATABASE and db_engine is not None:
+            bucket_store = DatabaseBucketStore(make_sessionmaker(db_engine))
+        else:
+            bucket_store = InMemoryBucketStore()
     proxy = ProxyService(
-        upstreams, transport, PolicyGuard(engine), authenticator, settings.parse_limits()
+        upstreams,
+        transport,
+        PolicyGuard(engine),
+        authenticator,
+        settings.parse_limits(),
+        RateLimiter(engine, bucket_store),
     )
 
     @asynccontextmanager
@@ -174,6 +195,7 @@ def create_app(
             default=policy.default.value,
             rule_count=len(policy.rules),
             rule_ids=[r.id for r in policy.rules],
+            rate_limit_ids=[r.id for r in policy.rate_limits],
         )
 
     @app.post("/v1/policy/evaluate", response_model=EvaluateResponse, tags=["policy"])

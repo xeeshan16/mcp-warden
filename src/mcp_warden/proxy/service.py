@@ -7,12 +7,14 @@ Responsibilities, in order:
 2. resolve the upstream by name (unknown servers never reach the network);
 3. parse the payload with the hardened parser; batches are accepted only when
    the client declared an MCP revision that still allowed them;
-4. handle each message: ``tools/call`` is checked against the policy before
-   it is forwarded, ``tools/list`` results are filtered on the way back, other
+4. handle each message: ``tools/call`` is checked against the policy and then
+   the rate limits before it is forwarded (a denied call never spends a
+   token), ``tools/list`` results are filtered on the way back, other
    requests are forwarded and answered, notifications and client responses
    are forwarded and acknowledged with ``202``;
 5. map every refusal and upstream failure onto a JSON-RPC error carrying the
-   request id.
+   request id. A single rate-limited call also gets a ``Retry-After`` header;
+   the HTTP status stays ``200`` because MCP clients read the JSON-RPC error.
 
 Batch entries are forwarded one by one (concurrently) rather than as a batch.
 That keeps per-call checks — policy, rate limits, budgets from the following
@@ -56,6 +58,7 @@ from mcp_warden.proxy.client import (
     UpstreamTransport,
 )
 from mcp_warden.proxy.enforcement import PolicyGuard
+from mcp_warden.ratelimit import RateLimitedError, RateLimiter
 from mcp_warden.upstreams import Upstream, UpstreamRegistry
 
 FORWARDED_HEADERS: tuple[str, ...] = (SESSION_HEADER, PROTOCOL_HEADER)
@@ -74,6 +77,7 @@ class ProxyResult:
 class _Outcome:
     response: UpstreamResponse | JsonRpcErrorResponse | None = None
     session_id: str | None = None
+    retry_after: int | None = None
 
 
 def forwarded_headers(headers: Mapping[str, str]) -> dict[str, str]:
@@ -89,8 +93,10 @@ class ProxyService:
         guard: PolicyGuard,
         authenticator: Authenticator,
         limits: ParseLimits | None = None,
+        limiter: RateLimiter | None = None,
     ) -> None:
         self.authenticator = authenticator
+        self.limiter = limiter
         self.registry = registry
         self.transport = transport
         self.guard = guard
@@ -136,6 +142,11 @@ class ProxyService:
         responses = [to_wire(o.response) for o in outcomes if o.response is not None]
         if not responses:
             return ProxyResult(202, None, out_headers)
+        if not parsed.is_batch:
+            # Only the gateway's own refusal sets it, never an upstream's error.
+            retry_after = outcomes[0].retry_after
+            if retry_after is not None:
+                out_headers["Retry-After"] = str(retry_after)
         return ProxyResult(200, responses if parsed.is_batch else responses[0], out_headers)
 
     async def _handle_item(
@@ -166,13 +177,18 @@ class ProxyService:
             if request.method == Method.TOOLS_CALL:
                 # Validated first so malformed calls never reach the upstream and
                 # the policy sees a well-formed tool name and arguments object.
-                self.guard.check_call(agent, upstream.name, parse_call_tool(request))
+                params = parse_call_tool(request)
+                self.guard.check_call(agent, upstream.name, params)
+                if self.limiter is not None:
+                    await self.limiter.check_call(agent, upstream.name, params.name)
             reply = await self.transport.send(
                 upstream, to_wire(request), response_id=request.id, headers=forwarded
             )
             response = reply.response
             if request.method == Method.TOOLS_LIST and isinstance(response, JsonRpcSuccess):
                 response = self.guard.filter_tools(agent, upstream.name, response)
+        except RateLimitedError as exc:
+            return _Outcome(error_response_from(exc, request.id), retry_after=exc.retry_after)
         except JsonRpcError as exc:
             return _Outcome(error_response_from(exc, request.id))
         return _Outcome(response, reply.session_id)
