@@ -169,6 +169,67 @@ class Rule(BaseModel):
         return bool(self.arguments)
 
 
+class LimitScope(StrEnum):
+    """What one token bucket of a rate limit is shared by."""
+
+    # One bucket per agent, shared by every call the limit matches.
+    AGENT = "agent"
+    # One bucket per agent, server and tool.
+    TOOL = "tool"
+
+
+class Period(StrEnum):
+    SECOND = "second"
+    MINUTE = "minute"
+    HOUR = "hour"
+    DAY = "day"
+
+    @property
+    def seconds(self) -> int:
+        return _PERIOD_SECONDS[self]
+
+
+_PERIOD_SECONDS = {Period.SECOND: 1, Period.MINUTE: 60, Period.HOUR: 3600, Period.DAY: 86400}
+
+_MAX_RATE_LIMITS = 100
+_MAX_REQUESTS = 1_000_000
+
+
+class RateLimit(BaseModel):
+    """A token-bucket limit on ``tools/call`` requests.
+
+    ``requests`` per ``per`` is the sustained rate; ``burst`` is the bucket
+    size, i.e. how many calls may arrive back to back after a quiet spell
+    (defaults to ``requests``). A call must take one token from the bucket of
+    every limit that matches it, so limits only ever add restrictions.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_.:-]+$")
+    description: str = ""
+    agents: list[str] = Field(default_factory=lambda: ["*"])
+    servers: list[str] = Field(default_factory=lambda: ["*"])
+    tools: list[str] = Field(default_factory=lambda: ["*"])
+    scope: LimitScope = LimitScope.AGENT
+    requests: StrictInt = Field(ge=1, le=_MAX_REQUESTS)
+    per: Period
+    burst: StrictInt | None = Field(default=None, ge=1, le=_MAX_REQUESTS)
+
+    @field_validator("agents", "servers", "tools")
+    @classmethod
+    def _check_patterns(cls, value: list[str]) -> list[str]:
+        return _validate_patterns(value)
+
+    @property
+    def capacity(self) -> int:
+        return self.burst if self.burst is not None else self.requests
+
+    @property
+    def refill_per_second(self) -> float:
+        return self.requests / self.per.seconds
+
+
 class Policy(BaseModel):
     """A complete policy document."""
 
@@ -177,12 +238,17 @@ class Policy(BaseModel):
     version: int = Field(ge=1, le=1)
     default: Effect = Effect.DENY
     rules: list[Rule] = Field(default_factory=list)
+    rate_limits: list[RateLimit] = Field(default_factory=list, max_length=_MAX_RATE_LIMITS)
 
     @model_validator(mode="after")
-    def _unique_rule_ids(self) -> Policy:
-        seen: set[str] = set()
-        for rule in self.rules:
-            if rule.id in seen:
-                raise ValueError(f"duplicate rule id: {rule.id!r}")
-            seen.add(rule.id)
+    def _unique_ids(self) -> Policy:
+        for kind, ids in (
+            ("rule", [r.id for r in self.rules]),
+            ("rate limit", [r.id for r in self.rate_limits]),
+        ):
+            seen: set[str] = set()
+            for item_id in ids:
+                if item_id in seen:
+                    raise ValueError(f"duplicate {kind} id: {item_id!r}")
+                seen.add(item_id)
         return self

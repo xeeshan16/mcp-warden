@@ -28,7 +28,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
         return 1
     print(
         f"ok: {args.policy} (version {policy.version}, {len(policy.rules)} rules, "
-        f"default {policy.default.value})"
+        f"{len(policy.rate_limits)} rate limits, default {policy.default.value})"
     )
     if args.agent and args.server and args.tool:
         arguments = None
@@ -49,6 +49,11 @@ def _cmd_check(args: argparse.Namespace) -> int:
             f"{decision.effect.value}: {args.agent} -> {args.server}/{args.tool} "
             f"(rule {rule}: {decision.reason})"
         )
+        for limit in PolicyEngine(policy).rate_limits_for(args.agent, args.server, args.tool):
+            print(
+                f"rate limit {limit.id}: {limit.requests}/{limit.per.value}, "
+                f"burst {limit.capacity}, per {limit.scope.value}"
+            )
     return 0
 
 

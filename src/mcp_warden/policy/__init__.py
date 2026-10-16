@@ -2,15 +2,26 @@
 
 from mcp_warden.policy.engine import Decision, PolicyEngine, ToolCallRequest
 from mcp_warden.policy.loader import PolicyError, load_policy, load_policy_file, parse_policy
-from mcp_warden.policy.model import ArgumentMatcher, Effect, Policy, Rule
+from mcp_warden.policy.model import (
+    ArgumentMatcher,
+    Effect,
+    LimitScope,
+    Period,
+    Policy,
+    RateLimit,
+    Rule,
+)
 
 __all__ = [
     "ArgumentMatcher",
     "Decision",
     "Effect",
+    "LimitScope",
+    "Period",
     "Policy",
     "PolicyEngine",
     "PolicyError",
+    "RateLimit",
     "Rule",
     "ToolCallRequest",
     "load_policy",

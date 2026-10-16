@@ -67,3 +67,35 @@ rules:
     tools: ["create_ticket"]
     arguments:
       - {path: title, max_length: 120}
+
+# --- Rate limits -------------------------------------------------------------
+# Token buckets on tools/call, checked after the rules (a denied call never
+# spends a token). `requests` per `per` (second, minute, hour, day) is the
+# sustained rate and `burst` the bucket size (defaults to `requests`).
+# `scope: agent` shares one bucket per agent across every matching call;
+# `scope: tool` keeps one per agent, server and tool. A call needs a token
+# from every limit that matches it; a refused call gets error -32003 with
+# `retry_after` seconds.
+rate_limits:
+  - id: per-agent
+    description: Overall ceiling for any one agent.
+    requests: 120
+    per: minute
+    burst: 30
+
+  - id: source-control-writes
+    description: Each write tool on GitHub, per agent.
+    servers: ["github"]
+    tools: ["create_*", "update_*", "merge_*", "push_*"]
+    scope: tool
+    requests: 20
+    per: hour
+    burst: 5
+
+  - id: demo-tickets
+    description: Ticket creation on the demo server, per agent.
+    servers: ["demo"]
+    tools: ["create_ticket"]
+    scope: tool
+    requests: 3
+    per: minute
