@@ -23,7 +23,7 @@ from fnmatch import translate
 from functools import lru_cache
 from typing import Any
 
-from mcp_warden.policy.model import ArgumentMatcher, Effect, Policy, RateLimit, Rule
+from mcp_warden.policy.model import ArgumentMatcher, Budget, Effect, Policy, RateLimit, Rule
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +139,7 @@ def matcher_holds(matcher: ArgumentMatcher, arguments: Mapping[str, Any]) -> boo
     return result is not matcher.negate
 
 
-def _identity_matches(rule: Rule | RateLimit, request: ToolCallRequest) -> bool:
+def _identity_matches(rule: Rule | RateLimit | Budget, request: ToolCallRequest) -> bool:
     return (
         _matches_any(request.agent, rule.agents)
         and _matches_any(request.server, rule.servers)
@@ -212,3 +212,8 @@ class PolicyEngine:
         """Every rate limit that applies to a call, in document order."""
         probe = ToolCallRequest(agent, server, tool)
         return [limit for limit in self._policy.rate_limits if _identity_matches(limit, probe)]
+
+    def budgets_for(self, agent: str, server: str, tool: str) -> list[Budget]:
+        """Every budget that applies to a call, in document order."""
+        probe = ToolCallRequest(agent, server, tool)
+        return [budget for budget in self._policy.budgets if _identity_matches(budget, probe)]

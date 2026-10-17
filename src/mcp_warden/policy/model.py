@@ -230,6 +230,57 @@ class RateLimit(BaseModel):
         return self.requests / self.per.seconds
 
 
+class BudgetWindow(StrEnum):
+    """A fixed calendar window in UTC; usage resets when the next one starts.
+
+    Weeks start on Monday (ISO 8601), months on the first.
+    """
+
+    HOUR = "hour"
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+
+
+_MAX_BUDGETS = 100
+_MAX_BUDGET_CALLS = 1_000_000_000
+_MAX_BUDGET_TOKENS = 1_000_000_000_000
+
+
+class Budget(BaseModel):
+    """A quota on ``tools/call`` usage per fixed window.
+
+    Where a rate limit smooths bursts, a budget caps the total: at most
+    ``max_calls`` calls and/or ``max_tokens`` estimated tokens (request
+    arguments plus tool results) per ``window``. Usage resets at the start of
+    the next window. Every budget that matches a call must have room for it,
+    so budgets only ever add restrictions.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_.:-]+$")
+    description: str = ""
+    agents: list[str] = Field(default_factory=lambda: ["*"])
+    servers: list[str] = Field(default_factory=lambda: ["*"])
+    tools: list[str] = Field(default_factory=lambda: ["*"])
+    scope: LimitScope = LimitScope.AGENT
+    window: BudgetWindow
+    max_calls: StrictInt | None = Field(default=None, ge=1, le=_MAX_BUDGET_CALLS)
+    max_tokens: StrictInt | None = Field(default=None, ge=1, le=_MAX_BUDGET_TOKENS)
+
+    @field_validator("agents", "servers", "tools")
+    @classmethod
+    def _check_patterns(cls, value: list[str]) -> list[str]:
+        return _validate_patterns(value)
+
+    @model_validator(mode="after")
+    def _has_a_limit(self) -> Budget:
+        if self.max_calls is None and self.max_tokens is None:
+            raise ValueError(f"budget {self.id!r} needs max_calls, max_tokens or both")
+        return self
+
+
 class Policy(BaseModel):
     """A complete policy document."""
 
@@ -239,12 +290,14 @@ class Policy(BaseModel):
     default: Effect = Effect.DENY
     rules: list[Rule] = Field(default_factory=list)
     rate_limits: list[RateLimit] = Field(default_factory=list, max_length=_MAX_RATE_LIMITS)
+    budgets: list[Budget] = Field(default_factory=list, max_length=_MAX_BUDGETS)
 
     @model_validator(mode="after")
     def _unique_ids(self) -> Policy:
         for kind, ids in (
             ("rule", [r.id for r in self.rules]),
             ("rate limit", [r.id for r in self.rate_limits]),
+            ("budget", [b.id for b in self.budgets]),
         ):
             seen: set[str] = set()
             for item_id in ids:

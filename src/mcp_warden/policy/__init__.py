@@ -4,6 +4,8 @@ from mcp_warden.policy.engine import Decision, PolicyEngine, ToolCallRequest
 from mcp_warden.policy.loader import PolicyError, load_policy, load_policy_file, parse_policy
 from mcp_warden.policy.model import (
     ArgumentMatcher,
+    Budget,
+    BudgetWindow,
     Effect,
     LimitScope,
     Period,
@@ -14,6 +16,8 @@ from mcp_warden.policy.model import (
 
 __all__ = [
     "ArgumentMatcher",
+    "Budget",
+    "BudgetWindow",
     "Decision",
     "Effect",
     "LimitScope",
