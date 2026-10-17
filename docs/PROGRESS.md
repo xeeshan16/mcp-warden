@@ -210,3 +210,46 @@ minute got `-32003` and `Retry-After: 20` and never reached the fake upstream.
 **Next (day 7):** budgets: call and token budgets per agent per window, a
 `TokenEstimator` interface with a deterministic estimator, a usage ledger, and
 `-32004` budget-exhausted errors.
+
+## Day 7 — 2026-10-17: budgets
+
+**Done**
+
+- `budgets` section in the policy (`mcp_warden.policy.model.Budget`): agent / server /
+  tool globs, `window: hour|day|week|month` (fixed UTC windows, weeks from Monday),
+  `max_calls` and/or `max_tokens` (at least one), `scope: agent|tool`. Strict
+  validation as for rate limits; `PolicyEngine.budgets_for()`.
+- `mcp_warden.budget`:
+  - `TokenEstimator` protocol and the deterministic `CharRatioEstimator`
+    (`ceil(chars / 4)`, configurable with `WARDEN_CHARS_PER_TOKEN`) over canonical JSON,
+    so key order and whitespace never change a count;
+  - `window_bounds()` for the four windows (year rollover, other time zones converted);
+  - the pure ledger logic: charges keyed by budget id and subject, all-or-nothing
+    `decide()` that reports the exhausted budget resetting last;
+  - `InMemoryUsageStore` (bounded: ended windows swept first, then LRU) and
+    `DatabaseUsageStore` (row-locked reserve in a fixed order, one retry on a
+    concurrent insert, atomic `tokens = tokens + n` settle, `records()` and `prune()`);
+  - `BudgetEnforcer`: reserve before forwarding, settle the reply's tokens after, and
+    `-32004` errors with `exhausted`, `used`, `limit`, `resets_at` and `retry_after`.
+- Alembic revision `0003` (`usage_counters`): one row per counter and window with
+  readable labels (cut to 200 characters; the digest identifies the counter).
+- Proxy: budgets run after the policy and rate limits; a forwarded call counts even if
+  the upstream fails; a failure to record reply tokens is logged and never fails the
+  call. `RetryAfterError` is now the shared base for rate-limit and budget refusals,
+  so both set `Retry-After` on single requests.
+- `WARDEN_USAGE_STORE=memory|database`; `mcp-warden usage [--agent] [--all]` reports the
+  database ledger; `mcp-warden check` and `GET /v1/policy` show budgets; the example
+  policy has three budgets.
+
+**Tests:** 454 passing locally on SQLite (66 new) with 21 PostgreSQL variants skipped;
+474 passing with a local PostgreSQL 16 (only the SQLite variant of the concurrency
+test skipped), 99% line coverage. ruff, ruff format, strict
+mypy and `uv build` clean. The PostgreSQL concurrency test (8 threads, 4 store
+instances, one budget of 10 calls, exactly 10 booked) was checked to fail with the row
+lock removed (48 booked). Verified by hand with both servers under uvicorn and both
+stores on PostgreSQL (output in the README): the 51st echo in an hour got `-32004` and
+`Retry-After: 3482` and never reached the fake upstream, while `add` still passed.
+
+**Next (day 8):** human approval: park `require_approval` calls in an approvals table,
+an admin approve/deny API, the agent receives a pending status or the result after
+approval, and expiry.

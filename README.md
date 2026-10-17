@@ -6,7 +6,7 @@
 **A self-hosted policy, budget and audit gateway for AI agent tool calls over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).**
 
-> Status: under active development (day 6 of a 14-day build). See
+> Status: under active development (day 7 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md)
 > for the daily log. Features marked _planned_ are not implemented yet.
 
@@ -46,7 +46,8 @@ with a policy file you can review in a pull request.
 | `mcp-warden db` / `agents` / `keys` commands to manage identities | ✅ day 5 |
 | Rate limits in the policy: token buckets per agent or per agent and tool, `Retry-After` | ✅ day 6 |
 | Rate-limit state in memory or shared through the database (row-locked on PostgreSQL) | ✅ day 6 |
-| Call and token budgets per time window | _planned_ |
+| Call and token budgets per hour, day, week or month, per agent or per agent and tool | ✅ day 7 |
+| Usage ledger in memory or the database, `mcp-warden usage` report | ✅ day 7 |
 | Human approval queue for risky tools | _planned_ |
 | Metadata-only audit log (no payloads stored) | _planned_ |
 | Prometheus metrics and OpenTelemetry tracing | _planned_ |
@@ -72,8 +73,8 @@ flowchart LR
 
 So far the policy engine (day 1), the JSON-RPC / MCP message layer (day 2), the proxy
 path to upstream servers (day 3), policy enforcement inside the proxy (day 4), agent
-authentication with API keys (day 5) and rate limits (day 6) are in place. Budgets,
-approvals and the audit log land over the following days (see the plan).
+authentication with API keys (day 5), rate limits (day 6) and budgets (day 7) are in
+place. Approvals and the audit log land over the following days (see the plan).
 
 ### Policy resolution
 
@@ -256,6 +257,68 @@ Where the buckets live is a deployment choice (`WARDEN_RATE_LIMIT_STORE`):
 
 Buckets are keyed by the limit's `id`: changing a limit's numbers keeps the current
 levels (clamped to the new size), renaming it starts afresh.
+
+### Budgets
+
+Rate limits smooth bursts; budgets cap totals. A budget allows at most `max_calls` calls
+and/or `max_tokens` estimated tokens per fixed UTC window:
+
+```yaml
+budgets:
+  - id: daily-calls            # every agent, every call
+    window: day                # hour | day | week (from Monday) | month
+    max_calls: 2000
+
+  - id: support-bot-tokens
+    agents: ["support-bot"]
+    window: day
+    max_tokens: 200000         # request arguments + tool replies
+
+  - id: demo-echo
+    servers: ["demo"]
+    tools: ["echo"]
+    scope: tool                # one counter per agent, server and tool
+    window: hour
+    max_calls: 50
+    max_tokens: 5000
+```
+
+- Budgets are checked **after** the rules and the rate limits, so denied and
+  rate-limited calls spend no budget. Every budget that matches a call must have room.
+- Booking is two-phase. Before forwarding, the call and its request tokens are reserved
+  against all of its budgets at once (all or nothing; a refused call books nothing).
+  When the reply arrives, its tokens are added. A reply's size is unknown in advance,
+  so the call that crosses a token limit completes and every later call in that window
+  is refused; refusing it would mean refusing a call whose tool already ran.
+- A forwarded call counts even if the upstream then fails or times out: the tool may
+  have run, and a budget that an upstream failure could refund would not be a budget.
+- A refused call gets JSON-RPC error `-32004` with the budget, which limit ran out
+  (`calls` or `tokens`), usage, `resets_at` and `retry_after`, plus a `Retry-After`
+  header on single requests. With several exhausted budgets, the one that resets last
+  is reported, because the call cannot pass before then.
+
+**Token estimates.** Tokens are counted by a `TokenEstimator`. The default is
+deterministic: `ceil(characters / 4)` (`WARDEN_CHARS_PER_TOKEN`) over the canonical JSON
+(sorted keys, no whitespace) of the call's name and arguments and of the reply's
+`result` or `error`. It needs no model files or network, gives the same count on every
+host, and is an estimate, not a model's exact tokenizer; a tokenizer-backed estimator
+can be passed to `create_app(token_estimator=...)`.
+
+**Usage ledger.** `WARDEN_USAGE_STORE` picks where usage is booked:
+
+- `memory` (default): per process and lost on restart. Fine for development and hourly
+  budgets on a single instance. Counters of ended windows are swept first when the
+  table passes 100,000 entries, then the least recently used.
+- `database`: one row per budget counter and window in `usage_counters` (calls, tokens,
+  window, readable agent/server/tool labels). Reserving locks the call's rows with
+  `SELECT ... FOR UPDATE` in a fixed order and writes only if every budget has room;
+  settling is a single atomic `UPDATE ... SET tokens = tokens + n`. Rows of past windows
+  remain as history (`mcp-warden usage --all`) until pruned. A test runs 8 threads
+  through 4 store instances against one PostgreSQL budget of 10 calls and checks that
+  exactly 10 are booked (with the row lock removed it overbooks; 48 in one run).
+
+Counters are keyed by the budget's `id`: changing its numbers keeps the usage so far in
+the window, renaming it starts afresh.
 
 ### Agent identity
 
@@ -459,6 +522,39 @@ $ psql -c "select tokens, full_at - updated_at as seconds_to_full from rate_limi
 upstream logged four requests, `initialize` and the three allowed calls; the fourth
 call never left the gateway.
 
+### See a budget run out
+
+With the example policy, each agent may call `echo` on the demo server 50 times an
+hour (`demo-echo`). Output from a local run with both servers as above, a support-bot
+key, `WARDEN_USAGE_STORE=database`, `WARDEN_RATE_LIMIT_STORE=database` and a fresh local
+PostgreSQL database in `WARDEN_DATABASE_URL`; the 50 calls were spaced 0.6 s apart to
+stay under the `per-agent` rate limit:
+
+```text
+$ mcp-warden db upgrade
+database at revision 0003
+$ tools/call echo {"text": "hello 1"} .. {"text": "hello 50"}
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello 1"}],"isError":false}}
+...
+{"jsonrpc":"2.0","id":50,"result":{"content":[{"type":"text","text":"hello 50"}],"isError":false}}
+$ tools/call echo {"text": "hello 51"}
+HTTP/1.1 200 OK
+retry-after: 3482
+{"jsonrpc":"2.0","id":51,"error":{"code":-32004,"message":"budget exhausted: demo-echo","data":{"server":"demo","tool":"echo","budget_id":"demo-echo","scope":"tool","window":"hour","exhausted":"calls","used":50,"limit":50,"resets_at":"2026-10-17T11:00:00Z","retry_after":3482}}}
+$ tools/call add {"a": 2, "b": 3}
+{"jsonrpc":"2.0","id":52,"result":{"content":[{"type":"text","text":"5"}],"isError":false,"structuredContent":{"sum":5}}}
+
+$ mcp-warden usage
+budget	agent	server/tool	window	calls	tokens
+demo-echo	support-bot	demo/echo	2026-10-17T10:00:00Z..2026-10-17T11:00:00Z	50	1400
+daily-calls	support-bot	*	2026-10-17T00:00:00Z..2026-10-18T00:00:00Z	51	1432
+support-bot-tokens	support-bot	*	2026-10-17T00:00:00Z..2026-10-18T00:00:00Z	51	1432
+```
+
+`add` still works because `demo-echo` is scoped to the tool, while the agent-wide
+budgets count both tools. The fake upstream logged 52 requests (`initialize`, 50 echoes
+and the `add`); the 51st echo never left the gateway.
+
 Dry-run a call with arguments without any upstream:
 
 ```bash
@@ -468,7 +564,8 @@ uv run mcp-warden check examples/policy.yaml \
 
 Configuration is read from `WARDEN_*` environment variables (`WARDEN_POLICY_PATH`,
 `WARDEN_UPSTREAMS_PATH`, `WARDEN_DATABASE_URL`, `WARDEN_AUTH_MODE` (`api-key` or
-`trusted-header`), `WARDEN_RATE_LIMIT_STORE` (`memory` or `database`), `WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`, the parser
+`trusted-header`), `WARDEN_RATE_LIMIT_STORE` and `WARDEN_USAGE_STORE` (`memory` or
+`database`), `WARDEN_CHARS_PER_TOKEN`, `WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`, the parser
 limits `WARDEN_MAX_MESSAGE_BYTES`, `WARDEN_MAX_JSON_DEPTH`, `WARDEN_MAX_BATCH_SIZE`, and
 `WARDEN_MAX_UPSTREAM_RESPONSE_BYTES`).
 
@@ -490,7 +587,7 @@ The database tests run on SQLite by default. Point `WARDEN_TEST_POSTGRES_URL` at
 throwaway PostgreSQL database (e.g.
 `postgresql+psycopg://warden:warden@localhost:5432/warden_test`, after
 `uv sync --extra postgres`) to also run them against PostgreSQL, including the
-concurrency test for shared rate limits.
+concurrency tests for shared rate limits and budgets.
 
 CI runs the same lint, type-check, test and build steps on every push, with a
 PostgreSQL 16 service so the PostgreSQL variants run too.

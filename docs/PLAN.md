@@ -68,3 +68,10 @@ composes them as a pipeline so a stage can short-circuit with a JSON-RPC error.
   the shared bucket store needs row-lock tests; day 13 keeps the remaining PostgreSQL
   integration work. Pruning refilled database buckets is a method for now and is wired
   into the retention job on day 9.
+- 2026-10-17: day 7 done as planned. Budgets are declared in the policy (`budgets`)
+  next to rate limits. Windows are fixed calendar windows in UTC rather than rolling,
+  so "per day" means what a reader expects and reset times can be reported. Token
+  counts are a deterministic estimate (characters / 4 over canonical JSON); an exact
+  tokenizer can be plugged in behind the `TokenEstimator` interface. Budget usage is
+  exposed through `mcp-warden usage` for now; the HTTP view arrives with the admin API
+  on day 10, and pruning ended windows is wired into the retention job on day 9.
