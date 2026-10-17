@@ -26,6 +26,13 @@ class RateLimitStore(StrEnum):
     DATABASE = "database"
 
 
+class UsageStoreKind(StrEnum):
+    # Budget usage in process memory: lost on restart, per gateway instance.
+    MEMORY = "memory"
+    # Budget usage in the database ledger: durable and shared.
+    DATABASE = "database"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="WARDEN_", env_file=".env", extra="ignore")
 
@@ -45,6 +52,16 @@ class Settings(BaseSettings):
     rate_limit_store: RateLimitStore = Field(
         default=RateLimitStore.MEMORY,
         description="Where token buckets for the policy's rate_limits are kept.",
+    )
+    usage_store: UsageStoreKind = Field(
+        default=UsageStoreKind.MEMORY,
+        description="Where usage for the policy's budgets is booked.",
+    )
+    chars_per_token: float = Field(
+        default=4.0,
+        gt=0,
+        le=100,
+        description="Characters per token for the default token estimator.",
     )
     host: str = "127.0.0.1"
     port: int = Field(default=8080, ge=1, le=65535)

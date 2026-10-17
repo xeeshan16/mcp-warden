@@ -99,3 +99,32 @@ rate_limits:
     scope: tool
     requests: 3
     per: minute
+
+# --- Budgets -----------------------------------------------------------------
+# Quotas on tools/call per fixed UTC window (hour, day, week starting Monday,
+# month), checked after the rate limits (a rate-limited call spends no
+# budget). `max_calls` caps the number of calls; `max_tokens` caps estimated
+# tokens of the call's arguments plus the tool's reply. A budget needs at
+# least one of the two. `scope` works as for rate limits. A refused call gets
+# error -32004 with `resets_at` and `retry_after`; usage resets when the next
+# window starts.
+budgets:
+  - id: daily-calls
+    description: Any one agent makes at most 2,000 tool calls a day.
+    window: day
+    max_calls: 2000
+
+  - id: support-bot-tokens
+    description: The support bot's daily token allowance across all servers.
+    agents: ["support-bot"]
+    window: day
+    max_tokens: 200000
+
+  - id: demo-echo
+    description: Echo on the demo server, per agent, each hour.
+    servers: ["demo"]
+    tools: ["echo"]
+    scope: tool
+    window: hour
+    max_calls: 50
+    max_tokens: 5000

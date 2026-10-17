@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +11,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from mcp_warden.app import create_app
+from mcp_warden.budget import UsageStore
 from mcp_warden.config import AuthMode, Settings
 from mcp_warden.fake_upstream import create_fake_upstream
 from mcp_warden.policy import Effect, Policy, PolicyEngine
@@ -40,6 +43,8 @@ def make_client(
     timeout: float = 2.0,
     engine: PolicyEngine | None = None,
     bucket_store: BucketStore | None = None,
+    usage_ledger: UsageStore | None = None,
+    budget_clock: Callable[[], datetime] | None = None,
     **settings: Any,
 ) -> TestClient:
     """Gateway in front of the fake upstream; the policy allows everything
@@ -58,6 +63,8 @@ def make_client(
         upstreams=registry,
         transport=transport,
         bucket_store=bucket_store,
+        usage_store=usage_ledger,
+        budget_clock=budget_clock,
     )
     return TestClient(app)
 

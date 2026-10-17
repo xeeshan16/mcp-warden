@@ -1,7 +1,8 @@
 """Command-line entry point.
 
 ``serve``, ``check`` and ``fake-upstream`` run the gateway and its tools;
-``db``, ``agents`` and ``keys`` manage the identity database.
+``db``, ``agents`` and ``keys`` manage the identity database; ``usage``
+reports the budget usage ledger.
 """
 
 from __future__ import annotations
@@ -28,7 +29,8 @@ def _cmd_check(args: argparse.Namespace) -> int:
         return 1
     print(
         f"ok: {args.policy} (version {policy.version}, {len(policy.rules)} rules, "
-        f"{len(policy.rate_limits)} rate limits, default {policy.default.value})"
+        f"{len(policy.rate_limits)} rate limits, {len(policy.budgets)} budgets, "
+        f"default {policy.default.value})"
     )
     if args.agent and args.server and args.tool:
         arguments = None
@@ -53,6 +55,16 @@ def _cmd_check(args: argparse.Namespace) -> int:
             print(
                 f"rate limit {limit.id}: {limit.requests}/{limit.per.value}, "
                 f"burst {limit.capacity}, per {limit.scope.value}"
+            )
+        for budget in PolicyEngine(policy).budgets_for(args.agent, args.server, args.tool):
+            caps = [
+                f"{value} {name}"
+                for name, value in (("calls", budget.max_calls), ("tokens", budget.max_tokens))
+                if value is not None
+            ]
+            print(
+                f"budget {budget.id}: {', '.join(caps)} per {budget.window.value}, "
+                f"per {budget.scope.value}"
             )
     return 0
 
@@ -118,6 +130,31 @@ def _with_store(args: argparse.Namespace, action: str) -> int:
         return 1
     finally:
         engine.dispose()
+
+
+def _cmd_usage(args: argparse.Namespace) -> int:
+    from mcp_warden.budget import DatabaseUsageStore
+    from mcp_warden.db import ensure_schema_current, make_engine, make_sessionmaker
+
+    engine = make_engine(_database_url(args))
+    try:
+        ensure_schema_current(engine)
+        records = DatabaseUsageStore(make_sessionmaker(engine)).records(
+            agent=args.agent, current_only=not args.all, limit=args.limit
+        )
+    except DatabaseNotReadyError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+    print("budget\tagent\tserver/tool\twindow\tcalls\ttokens")
+    for r in records:
+        target = f"{r.server}/{r.tool}" if r.server is not None else "*"
+        print(
+            f"{r.budget_id}\t{r.agent}\t{target}\t{_fmt(r.window_start)}..{_fmt(r.window_end)}"
+            f"\t{r.calls}\t{r.tokens}"
+        )
+    return 0
 
 
 def _fmt(ts: datetime | None) -> str:
@@ -235,6 +272,14 @@ def _add_identity_commands(sub: argparse._SubParsersAction[argparse.ArgumentPars
     revoke = keys_sub.add_parser("revoke", parents=[db_url], help="revoke a key by prefix")
     revoke.add_argument("prefix")
     identity(revoke, "keys-revoke")
+
+    usage = sub.add_parser(
+        "usage", parents=[db_url], help="show budget usage from the database ledger"
+    )
+    usage.add_argument("--agent", help="only this agent")
+    usage.add_argument("--all", action="store_true", help="include windows that have ended")
+    usage.add_argument("--limit", type=_positive_int, default=100)
+    usage.set_defaults(func=_cmd_usage)
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -7,13 +7,16 @@ Responsibilities, in order:
 2. resolve the upstream by name (unknown servers never reach the network);
 3. parse the payload with the hardened parser; batches are accepted only when
    the client declared an MCP revision that still allowed them;
-4. handle each message: ``tools/call`` is checked against the policy and then
-   the rate limits before it is forwarded (a denied call never spends a
-   token), ``tools/list`` results are filtered on the way back, other
+4. handle each message: ``tools/call`` is checked against the policy, then
+   the rate limits, then the budgets before it is forwarded (a denied call
+   never spends a token, a rate-limited call never spends budget), and the
+   reply's tokens are booked against the budgets once it arrives;
+   ``tools/list`` results are filtered on the way back, other
    requests are forwarded and answered, notifications and client responses
    are forwarded and acknowledged with ``202``;
 5. map every refusal and upstream failure onto a JSON-RPC error carrying the
-   request id. A single rate-limited call also gets a ``Retry-After`` header;
+   request id. A single rate-limited or over-budget call also gets a
+   ``Retry-After`` header;
    the HTTP status stays ``200`` because MCP clients read the JSON-RPC error.
 
 Batch entries are forwarded one by one (concurrently) rather than as a batch.
@@ -34,6 +37,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from mcp_warden.budget import BudgetEnforcer, Reservation
 from mcp_warden.identity import AuthenticationError, Authenticator
 from mcp_warden.jsonrpc import (
     ErrorCode,
@@ -44,6 +48,7 @@ from mcp_warden.jsonrpc import (
     JsonRpcSuccess,
     ParsedItem,
     ParseLimits,
+    RetryAfterError,
     error_response,
     error_response_from,
     parse_payload,
@@ -58,7 +63,7 @@ from mcp_warden.proxy.client import (
     UpstreamTransport,
 )
 from mcp_warden.proxy.enforcement import PolicyGuard
-from mcp_warden.ratelimit import RateLimitedError, RateLimiter
+from mcp_warden.ratelimit import RateLimiter
 from mcp_warden.upstreams import Upstream, UpstreamRegistry
 
 FORWARDED_HEADERS: tuple[str, ...] = (SESSION_HEADER, PROTOCOL_HEADER)
@@ -94,9 +99,11 @@ class ProxyService:
         authenticator: Authenticator,
         limits: ParseLimits | None = None,
         limiter: RateLimiter | None = None,
+        budgets: BudgetEnforcer | None = None,
     ) -> None:
         self.authenticator = authenticator
         self.limiter = limiter
+        self.budgets = budgets
         self.registry = registry
         self.transport = transport
         self.guard = guard
@@ -173,6 +180,7 @@ class ProxyService:
         request: JsonRpcRequest,
         forwarded: Mapping[str, str],
     ) -> _Outcome:
+        reservation: Reservation | None = None
         try:
             if request.method == Method.TOOLS_CALL:
                 # Validated first so malformed calls never reach the upstream and
@@ -181,13 +189,19 @@ class ProxyService:
                 self.guard.check_call(agent, upstream.name, params)
                 if self.limiter is not None:
                     await self.limiter.check_call(agent, upstream.name, params.name)
+                if self.budgets is not None:
+                    reservation = await self.budgets.reserve(
+                        agent, upstream.name, params.name, params.arguments
+                    )
             reply = await self.transport.send(
                 upstream, to_wire(request), response_id=request.id, headers=forwarded
             )
             response = reply.response
+            if self.budgets is not None and reservation is not None and response is not None:
+                await self.budgets.settle(reservation, response)
             if request.method == Method.TOOLS_LIST and isinstance(response, JsonRpcSuccess):
                 response = self.guard.filter_tools(agent, upstream.name, response)
-        except RateLimitedError as exc:
+        except RetryAfterError as exc:
             return _Outcome(error_response_from(exc, request.id), retry_after=exc.retry_after)
         except JsonRpcError as exc:
             return _Outcome(error_response_from(exc, request.id))

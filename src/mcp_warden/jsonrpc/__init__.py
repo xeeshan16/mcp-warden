@@ -1,6 +1,6 @@
 """JSON-RPC 2.0 envelopes, a defensive parser and typed MCP message views."""
 
-from mcp_warden.jsonrpc.errors import ErrorCode, JsonRpcError
+from mcp_warden.jsonrpc.errors import ErrorCode, JsonRpcError, RetryAfterError
 from mcp_warden.jsonrpc.messages import (
     JSONRPC_VERSION,
     ErrorObject,
@@ -42,6 +42,7 @@ __all__ = [
     "ParseResult",
     "ParsedItem",
     "RequestId",
+    "RetryAfterError",
     "decode_json",
     "error_response",
     "error_response_from",

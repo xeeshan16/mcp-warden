@@ -14,7 +14,7 @@ import math
 from collections.abc import Sequence
 from typing import Protocol
 
-from mcp_warden.jsonrpc import ErrorCode, JsonRpcError
+from mcp_warden.jsonrpc import ErrorCode, RetryAfterError
 from mcp_warden.policy import LimitScope, PolicyEngine, RateLimit
 from mcp_warden.ratelimit.bucket import Acquisition, BucketSpec
 
@@ -36,12 +36,11 @@ def retry_after_seconds(wait: float) -> int:
     return max(1, math.ceil(wait))
 
 
-class RateLimitedError(JsonRpcError):
+class RateLimitedError(RetryAfterError):
     """``RATE_LIMITED``, with the wait in whole seconds for ``Retry-After``."""
 
     def __init__(self, message: str, data: dict[str, object], retry_after: int) -> None:
-        super().__init__(ErrorCode.RATE_LIMITED, message, data)
-        self.retry_after = retry_after
+        super().__init__(ErrorCode.RATE_LIMITED, message, data, retry_after)
 
 
 class RateLimiter:

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Request
@@ -12,7 +13,15 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from mcp_warden import __version__
-from mcp_warden.config import AuthMode, RateLimitStore, Settings
+from mcp_warden.budget import (
+    BudgetEnforcer,
+    CharRatioEstimator,
+    DatabaseUsageStore,
+    InMemoryUsageStore,
+    TokenEstimator,
+    UsageStore,
+)
+from mcp_warden.config import AuthMode, RateLimitStore, Settings, UsageStoreKind
 from mcp_warden.db import ensure_schema_current, make_engine, make_sessionmaker
 from mcp_warden.identity import (
     ApiKeyAuthenticator,
@@ -64,6 +73,7 @@ class PolicySummary(BaseModel):
     rule_count: int
     rule_ids: list[str]
     rate_limit_ids: list[str]
+    budget_ids: list[str]
 
 
 def get_engine(request: Request) -> PolicyEngine:
@@ -116,6 +126,9 @@ def create_app(
     transport: UpstreamTransport | None = None,
     authenticator: Authenticator | None = None,
     bucket_store: BucketStore | None = None,
+    usage_store: UsageStore | None = None,
+    token_estimator: TokenEstimator | None = None,
+    budget_clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     """Build the FastAPI app.
 
@@ -137,8 +150,10 @@ def create_app(
         max_json_depth=settings.max_json_depth,
     )
     db_engine = None
-    if (authenticator is None and settings.auth_mode is AuthMode.API_KEY) or (
-        bucket_store is None and settings.rate_limit_store is RateLimitStore.DATABASE
+    if (
+        (authenticator is None and settings.auth_mode is AuthMode.API_KEY)
+        or (bucket_store is None and settings.rate_limit_store is RateLimitStore.DATABASE)
+        or (usage_store is None and settings.usage_store is UsageStoreKind.DATABASE)
     ):
         db_engine = make_engine(settings.database_url)
         try:
@@ -160,6 +175,17 @@ def create_app(
             bucket_store = DatabaseBucketStore(make_sessionmaker(db_engine))
         else:
             bucket_store = InMemoryBucketStore()
+    if usage_store is None:
+        if settings.usage_store is UsageStoreKind.DATABASE and db_engine is not None:
+            usage_store = DatabaseUsageStore(make_sessionmaker(db_engine))
+        else:
+            usage_store = InMemoryUsageStore()
+    budgets = BudgetEnforcer(
+        engine,
+        usage_store,
+        token_estimator or CharRatioEstimator(settings.chars_per_token),
+        budget_clock,
+    )
     proxy = ProxyService(
         upstreams,
         transport,
@@ -167,6 +193,7 @@ def create_app(
         authenticator,
         settings.parse_limits(),
         RateLimiter(engine, bucket_store),
+        budgets,
     )
 
     @asynccontextmanager
@@ -196,6 +223,7 @@ def create_app(
             rule_count=len(policy.rules),
             rule_ids=[r.id for r in policy.rules],
             rate_limit_ids=[r.id for r in policy.rate_limits],
+            budget_ids=[b.id for b in policy.budgets],
         )
 
     @app.post("/v1/policy/evaluate", response_model=EvaluateResponse, tags=["policy"])

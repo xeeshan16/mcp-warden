@@ -42,3 +42,11 @@ class JsonRpcError(Exception):
 
     def __repr__(self) -> str:
         return f"JsonRpcError(code={self.code}, message={self.message!r})"
+
+
+class RetryAfterError(JsonRpcError):
+    """A refusal that clears with time; ``retry_after`` (whole seconds) feeds ``Retry-After``."""
+
+    def __init__(self, code: ErrorCode | int, message: str, data: Any, retry_after: int) -> None:
+        super().__init__(code, message, data)
+        self.retry_after = retry_after
