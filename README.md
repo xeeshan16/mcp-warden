@@ -6,7 +6,7 @@
 **A self-hosted policy, budget and audit gateway for AI agent tool calls over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).**
 
-> Status: under active development (day 7 of a 14-day build). See
+> Status: under active development (day 8 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md)
 > for the daily log. Features marked _planned_ are not implemented yet.
 
@@ -48,7 +48,8 @@ with a policy file you can review in a pull request.
 | Rate-limit state in memory or shared through the database (row-locked on PostgreSQL) | ✅ day 6 |
 | Call and token budgets per hour, day, week or month, per agent or per agent and tool | ✅ day 7 |
 | Usage ledger in memory or the database, `mcp-warden usage` report | ✅ day 7 |
-| Human approval queue for risky tools | _planned_ |
+| Human approval for `require_approval` calls: parked requests, single-use approvals, expiry | ✅ day 8 |
+| Admin API (`/v1/approvals`, bearer token) and `mcp-warden approvals` to review the queue | ✅ day 8 |
 | Metadata-only audit log (no payloads stored) | _planned_ |
 | Prometheus metrics and OpenTelemetry tracing | _planned_ |
 | PostgreSQL persistence, Docker Compose demo | _planned_ |
@@ -61,9 +62,9 @@ flowchart LR
     subgraph W[MCP Warden]
         direction TB
         AU[Authenticate agent] --> P[Policy engine]
-        P --> RL[Rate limits and budgets]
-        RL --> AP[Approval queue]
-        AP --> AL[Audit log]
+        P --> AP[Approval queue]
+        AP --> RL[Rate limits and budgets]
+        RL --> AL[Audit log]
     end
     W -- "forward allowed calls" --> S1[MCP server: github]
     W --> S2[MCP server: tickets]
@@ -73,8 +74,8 @@ flowchart LR
 
 So far the policy engine (day 1), the JSON-RPC / MCP message layer (day 2), the proxy
 path to upstream servers (day 3), policy enforcement inside the proxy (day 4), agent
-authentication with API keys (day 5), rate limits (day 6) and budgets (day 7) are in
-place. Approvals and the audit log land over the following days (see the plan).
+authentication with API keys (day 5), rate limits (day 6), budgets (day 7) and human
+approval (day 8) are in place. The audit log lands next (see the plan).
 
 ### Policy resolution
 
@@ -154,7 +155,7 @@ apart from upstream failures:
 | Code | Meaning |
 | --- | --- |
 | -32001 | denied by policy |
-| -32002 | human approval required |
+| -32002 | human approval required (the call was parked; repeat it to collect the decision) |
 | -32003 | rate limited |
 | -32004 | budget exhausted |
 | -32005 / -32006 | upstream error / upstream timeout |
@@ -193,7 +194,7 @@ Inside the proxy, each `tools/call` is validated and then evaluated with the age
 upstream name, the tool name and its arguments **before** anything is forwarded:
 
 - `deny` → error `-32001` with the deciding rule; the upstream never sees the call;
-- `require_approval` → error `-32002` (parking the call for a human arrives on day 8);
+- `require_approval` → parked for a human (see [Human approval](#human-approval));
 - `allow` → forwarded.
 
 `tools/list` replies are filtered so an agent is only shown tools it could ever call.
@@ -319,6 +320,72 @@ can be passed to `create_app(token_estimator=...)`.
 
 Counters are keyed by the budget's `id`: changing its numbers keeps the usage so far in
 the window, renaming it starts afresh.
+
+### Human approval
+
+A call whose decision is `require_approval` is not forwarded. The gateway parks it as an
+approval request and answers JSON-RPC error `-32002` with the request's `approval_id`,
+`status: "pending"`, `expires_at` and a `Retry-After` hint. A reviewer approves or denies
+it, and the agent collects the decision by **repeating the identical call**, so any MCP
+client works without changes:
+
+| Request state | What the repeated call gets |
+| --- | --- |
+| `pending` | `-32002` with the same `approval_id`; no second request is opened |
+| `approved` | the call runs once (after rate limits and budgets) and the request becomes `executed` |
+| `denied` | `-32001` with the reviewer and their note, for as long as the decision holds |
+| `executed` / `expired` | a fresh `pending` request: every execution needs its own approval |
+
+- **One approval, one exact call.** A request is identified by a fingerprint, the
+  SHA-256 of the agent, server, tool and canonical arguments (key order and whitespace
+  do not matter). An approval cannot be spent on different arguments or by another
+  agent, and it is spent by exactly one execution.
+- **Expiry.** A request waits `WARDEN_APPROVAL_TTL_SECONDS` (15 minutes) for a
+  reviewer. A decision holds for `WARDEN_APPROVAL_DECISION_TTL_SECONDS` (10 minutes): an
+  approval unused by then expires, and a denial answers repeats for that long so an
+  agent cannot reopen a request it was just refused by retrying. Expiry is computed on
+  read, so no background job is needed for correctness.
+- **Order in the pipeline.** Approval runs after the rules and before rate limits and
+  budgets, so a waiting call spends nothing. The approval is spent last, right before
+  forwarding, so an approved call refused by a rate limit keeps its approval for the
+  retry. (Two identical approved calls racing each other: one runs; the other may
+  already have taken a rate-limit token and budget before finding the approval spent,
+  and gets `-32002` for a new request.)
+- **Queue cap.** An agent can have at most `WARDEN_APPROVAL_MAX_PENDING_PER_AGENT` (20)
+  requests waiting; past that, new requests get `-32003` with `Retry-After`, so a
+  looping agent cannot flood reviewers.
+- **Optional waiting.** With `WARDEN_APPROVAL_WAIT_SECONDS` > 0 the gateway holds the
+  call that long, polling for a decision, and answers with the tool's result if the
+  approval arrives in time. The default (0) answers at once, which suits clients with
+  short request timeouts.
+- **What reviewers see.** The request stores the call's arguments, because a reviewer
+  cannot judge a call without them. They are dropped when the request is denied,
+  executed or expires, leaving only their digest and size.
+
+**Reviewing.** Two ways to see the queue and decide:
+
+- the admin API, enabled by setting `WARDEN_ADMIN_TOKEN` (at least 16 characters; the
+  API answers `503` while it is unset, and `401` to anything but
+  `Authorization: Bearer <token>`, compared in constant time):
+  `GET /v1/approvals?status=pending&agent=...`, `GET /v1/approvals/{id}`,
+  `POST /v1/approvals/{id}/approve` and `.../deny` with `{"reviewer": "...", "note": "..."}`.
+  Deciding a request that is not pending is `409`. Per-reviewer admin identities
+  arrive with the admin API on day 10; until then `reviewer` is recorded as given;
+- `mcp-warden approvals list | show <id> | approve <id> | deny <id>`, working directly
+  on the database.
+
+**Where requests live.** `WARDEN_APPROVAL_STORE` picks the store:
+
+- `memory` (default): per process, lost on restart, decided through the admin API only.
+  At most 10,000 requests are kept (finished ones are dropped first).
+- `database`: the `approval_requests` table, shared by every gateway instance and the
+  CLI. Two guarantees of the database carry the concurrency: an `open_key` column holds
+  the fingerprint while a request is open and is unique, so identical calls racing to
+  open a request create one (the loser retries and finds it); and claiming or deciding
+  is a single conditional `UPDATE ... WHERE status = 'approved' AND expires_at > now`,
+  so exactly one claim wins and a request is never both approved and denied. Tests run
+  8 threads against PostgreSQL for both; without the retry on the unique key, the same
+  open race raised 26 integrity errors over 5 rounds.
 
 ### Agent identity
 
@@ -555,6 +622,50 @@ support-bot-tokens	support-bot	*	2026-10-17T00:00:00Z..2026-10-18T00:00:00Z	51	1
 budgets count both tools. The fake upstream logged 52 requests (`initialize`, 50 echoes
 and the `add`); the 51st echo never left the gateway.
 
+### Approve a parked call
+
+The example policy sends `support-bot`'s urgent tickets to a human
+(`urgent-tickets-need-a-human`). Output from a local run with both servers as above, a
+support-bot key, `WARDEN_APPROVAL_STORE=database`, `WARDEN_ADMIN_TOKEN` set and a fresh
+local PostgreSQL database in `WARDEN_DATABASE_URL`:
+
+```text
+$ mcp-warden db upgrade
+database at revision 0004
+$ tools/call create_ticket {"title": "Checkout is down", "priority": "urgent"}
+HTTP/1.1 200 OK
+retry-after: 5
+{"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"tool call requires human approval: create_ticket","data":{"server":"demo","tool":"create_ticket","effect":"require_approval","rule_id":"urgent-tickets-need-a-human","reason":"An urgent ticket pages someone, so a person signs it off first.","approval_id":"apr_05761497c50ebe50647a9d46","status":"pending","expires_at":"2026-10-18T10:19:48Z","retry_after":5}}}
+
+$ mcp-warden approvals list
+id	status	agent	server/tool	rule	created	expires
+apr_05761497c50ebe50647a9d46	pending	support-bot	demo/create_ticket	urgent-tickets-need-a-human	2026-10-18T10:04:48Z	2026-10-18T10:19:48Z
+
+$ curl -X POST localhost:8080/v1/approvals/apr_05761497c50ebe50647a9d46/approve \
+    -H "authorization: Bearer $WARDEN_ADMIN_TOKEN" -H 'content-type: application/json' \
+    -d '{"reviewer":"alice","note":"on-call confirmed the outage"}'
+{"id":"apr_05761497c50ebe50647a9d46","status":"approved","agent":"support-bot","server":"demo","tool":"create_ticket","rule_id":"urgent-tickets-need-a-human","reason":"An urgent ticket pages someone, so a person signs it off first.","arguments":{"priority":"urgent","title":"Checkout is down"},"arguments_digest":"a96e1602c823d2e771d1d550d873d9d210ac400acf0f44b7cba913e06cf3a51b","arguments_size":48,"created_at":"2026-10-18T10:04:48Z","expires_at":"2026-10-18T10:14:50Z","decided_at":"2026-10-18T10:04:50Z","decided_by":"alice","note":"on-call confirmed the outage","executed_at":null}
+
+$ the same tools/call again
+HTTP/1.1 200 OK
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"created ticket T-13158DF0"}],"isError":false}}
+
+$ and once more (an approval covers one execution)
+{"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"tool call requires human approval: create_ticket","data":{"server":"demo","tool":"create_ticket","effect":"require_approval","rule_id":"urgent-tickets-need-a-human","reason":"An urgent ticket pages someone, so a person signs it off first.","approval_id":"apr_ee72ffd4a71dfdeb34692bb0","status":"pending","expires_at":"2026-10-18T10:19:50Z","retry_after":5}}}
+
+$ mcp-warden approvals deny apr_ee72ffd4a71dfdeb34692bb0 --reviewer bob --note 'duplicate of the first ticket'
+denied apr_ee72ffd4a71dfdeb34692bb0: support-bot -> demo/create_ticket (valid until 2026-10-18T10:14:52Z)
+$ the same tools/call again
+{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"tool call denied by a reviewer: create_ticket","data":{"server":"demo","tool":"create_ticket","effect":"require_approval","rule_id":"urgent-tickets-need-a-human","reason":"An urgent ticket pages someone, so a person signs it off first.","approval_id":"apr_ee72ffd4a71dfdeb34692bb0","status":"denied","decided_by":"bob","note":"duplicate of the first ticket"}}}
+
+$ mcp-warden approvals list --status all
+id	status	agent	server/tool	rule	created	expires
+apr_ee72ffd4a71dfdeb34692bb0	denied	support-bot	demo/create_ticket	urgent-tickets-need-a-human	2026-10-18T10:04:50Z	2026-10-18T10:14:52Z
+apr_05761497c50ebe50647a9d46	executed	support-bot	demo/create_ticket	urgent-tickets-need-a-human	2026-10-18T10:04:48Z	2026-10-18T10:14:50Z
+```
+
+The fake upstream logged two requests, `initialize` and the one approved ticket.
+
 Dry-run a call with arguments without any upstream:
 
 ```bash
@@ -565,7 +676,11 @@ uv run mcp-warden check examples/policy.yaml \
 Configuration is read from `WARDEN_*` environment variables (`WARDEN_POLICY_PATH`,
 `WARDEN_UPSTREAMS_PATH`, `WARDEN_DATABASE_URL`, `WARDEN_AUTH_MODE` (`api-key` or
 `trusted-header`), `WARDEN_RATE_LIMIT_STORE` and `WARDEN_USAGE_STORE` (`memory` or
-`database`), `WARDEN_CHARS_PER_TOKEN`, `WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`, the parser
+`database`), `WARDEN_CHARS_PER_TOKEN`, the approval settings `WARDEN_APPROVAL_STORE`
+(`memory` or `database`), `WARDEN_APPROVAL_TTL_SECONDS`,
+`WARDEN_APPROVAL_DECISION_TTL_SECONDS`, `WARDEN_APPROVAL_WAIT_SECONDS`,
+`WARDEN_APPROVAL_MAX_PENDING_PER_AGENT`, `WARDEN_APPROVAL_RETRY_AFTER_SECONDS` and
+`WARDEN_ADMIN_TOKEN`, `WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`, the parser
 limits `WARDEN_MAX_MESSAGE_BYTES`, `WARDEN_MAX_JSON_DEPTH`, `WARDEN_MAX_BATCH_SIZE`, and
 `WARDEN_MAX_UPSTREAM_RESPONSE_BYTES`).
 
@@ -587,7 +702,7 @@ The database tests run on SQLite by default. Point `WARDEN_TEST_POSTGRES_URL` at
 throwaway PostgreSQL database (e.g.
 `postgresql+psycopg://warden:warden@localhost:5432/warden_test`, after
 `uv sync --extra postgres`) to also run them against PostgreSQL, including the
-concurrency tests for shared rate limits and budgets.
+concurrency tests for shared rate limits, budgets and approvals.
 
 CI runs the same lint, type-check, test and build steps on every push, with a
 PostgreSQL 16 service so the PostgreSQL variants run too.

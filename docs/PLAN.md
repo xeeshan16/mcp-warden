@@ -75,3 +75,10 @@ composes them as a pipeline so a stage can short-circuit with a JSON-RPC error.
   tokenizer can be plugged in behind the `TokenEstimator` interface. Budget usage is
   exposed through `mcp-warden usage` for now; the HTTP view arrives with the admin API
   on day 10, and pruning ended windows is wired into the retention job on day 9.
+- 2026-10-18: day 8 done as planned. Agents collect a decision by repeating the
+  identical call (matched by a fingerprint of agent, server, tool and arguments) rather
+  than through a new endpoint, so unmodified MCP clients work; holding the request open
+  until a decision is an opt-in setting. Approvals are single-use and expire. The admin
+  API for approvals is protected by a single bearer token for now; per-reviewer admin
+  identities and the rest of the admin API stay on day 10. Pruning finished approval
+  requests is added to the day 9 retention job.

@@ -253,3 +253,49 @@ stores on PostgreSQL (output in the README): the 51st echo in an hour got `-3200
 **Next (day 8):** human approval: park `require_approval` calls in an approvals table,
 an admin approve/deny API, the agent receives a pending status or the result after
 approval, and expiry.
+
+## Day 8 — 2026-10-18: human approval
+
+**Done**
+
+- `mcp_warden.approval`:
+  - approval requests identified by a fingerprint (SHA-256 of agent, server, tool and
+    canonical arguments), with `pending → approved → executed`, `pending → denied` and
+    lazy expiry; arguments kept for the reviewer and dropped once a request is denied,
+    executed or expired (digest and size remain);
+  - `InMemoryApprovalStore` (bounded, finished requests evicted first) and
+    `DatabaseApprovalStore`: a unique `open_key` stops identical calls from opening two
+    requests (the losing insert retries once), and claim/decide are single conditional
+    `UPDATE`s, so an approval is spent exactly once;
+  - `ApprovalGate`: pending → `-32002` with `approval_id`, `expires_at` and
+    `Retry-After`; approved → admitted and claimed just before forwarding; denied →
+    `-32001` with reviewer and note while the decision holds; a per-agent cap on
+    waiting requests (`-32003`); an optional in-gateway wait that polls for a decision.
+- Alembic revision `0004` (`approval_requests`).
+- Proxy: `require_approval` goes to the gate after the rules and before rate limits and
+  budgets; the approval is spent last so a rate-limited call keeps it.
+  `PolicyGuard.evaluate_call` separates the deny check from approval routing.
+- Admin API behind `WARDEN_ADMIN_TOKEN` (bearer, constant-time compare, disabled with
+  `503` when unset): list, show, approve and deny under `/v1/approvals`; `409` for
+  requests that are no longer pending.
+- CLI: `mcp-warden approvals list|show|approve|deny` on the database store.
+- Settings: `WARDEN_APPROVAL_STORE`, `..._TTL_SECONDS`, `..._DECISION_TTL_SECONDS`,
+  `..._WAIT_SECONDS`, `..._MAX_PENDING_PER_AGENT`, `..._RETRY_AFTER_SECONDS`,
+  `WARDEN_ADMIN_TOKEN`.
+- Example policy: `urgent-tickets-need-a-human` for the support bot's urgent demo tickets.
+
+**Tests:** 517 passing locally on SQLite (83 new) with 41 PostgreSQL variants skipped;
+557 passing with a local PostgreSQL 16, 99% line coverage. ruff, ruff format, strict
+mypy and `uv build` clean, and the wheel contains migration `0004`. The PostgreSQL
+tests race 8 threads opening the same request (one request results) and 8 threads
+claiming one approval (exactly one wins). Without the retry on the unique key, the open
+race raised 26 integrity errors in 5 rounds of 8 threads. Verified by hand with both
+servers under uvicorn, API keys and the database store on PostgreSQL (output in the
+README): the urgent ticket was parked, approved over the admin API, ran once, the
+repeat opened a new request, which was denied from the CLI; the fake upstream saw only
+`initialize` and the one approved call.
+
+**Next (day 9):** audit log: metadata-only records (agent, server, tool, decision,
+latency, argument hash and size, never payloads), query API with filters and cursor
+pagination, and a retention job (which also prunes ended budget windows, refilled
+rate-limit buckets and finished approval requests).
