@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from mcp_warden.jsonrpc.parser import ParseLimits
@@ -30,6 +30,13 @@ class UsageStoreKind(StrEnum):
     # Budget usage in process memory: lost on restart, per gateway instance.
     MEMORY = "memory"
     # Budget usage in the database ledger: durable and shared.
+    DATABASE = "database"
+
+
+class ApprovalStoreKind(StrEnum):
+    # Requests in process memory: decided through the admin API, lost on restart.
+    MEMORY = "memory"
+    # Requests in the database: shared by gateways, decidable from the CLI.
     DATABASE = "database"
 
 
@@ -63,6 +70,35 @@ class Settings(BaseSettings):
         le=100,
         description="Characters per token for the default token estimator.",
     )
+    approval_store: ApprovalStoreKind = Field(
+        default=ApprovalStoreKind.MEMORY,
+        description="Where approval requests for require_approval calls are kept.",
+    )
+    approval_ttl_seconds: int = Field(
+        default=900, ge=1, le=7 * 86400, description="How long a request waits for a reviewer."
+    )
+    approval_decision_ttl_seconds: int = Field(
+        default=600,
+        ge=1,
+        le=7 * 86400,
+        description="How long an approval can be used, and a denial is repeated.",
+    )
+    approval_wait_seconds: float = Field(
+        default=0,
+        ge=0,
+        le=60,
+        description="How long a call waits in the gateway for a decision before -32002.",
+    )
+    approval_max_pending_per_agent: int = Field(
+        default=20, ge=1, description="Most requests one agent may have waiting at once."
+    )
+    approval_retry_after_seconds: int = Field(
+        default=5, ge=1, description="Retry-After suggested to agents waiting for a decision."
+    )
+    admin_token: SecretStr | None = Field(
+        default=None,
+        description="Bearer token for the admin API (/v1/approvals); unset disables it.",
+    )
     host: str = "127.0.0.1"
     port: int = Field(default=8080, ge=1, le=65535)
     log_level: str = "info"
@@ -75,6 +111,13 @@ class Settings(BaseSettings):
     max_upstream_response_bytes: int = Field(
         default=10_000_000, ge=1, description="Largest upstream reply accepted, in bytes."
     )
+
+    @field_validator("admin_token")
+    @classmethod
+    def _strong_admin_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and len(value.get_secret_value()) < 16:
+            raise ValueError("WARDEN_ADMIN_TOKEN must be at least 16 characters")
+        return value
 
     def parse_limits(self, *, allow_batch: bool = True) -> ParseLimits:
         return ParseLimits(

@@ -8,15 +8,17 @@ Responsibilities, in order:
 3. parse the payload with the hardened parser; batches are accepted only when
    the client declared an MCP revision that still allowed them;
 4. handle each message: ``tools/call`` is checked against the policy, then
-   the rate limits, then the budgets before it is forwarded (a denied call
-   never spends a token, a rate-limited call never spends budget), and the
-   reply's tokens are booked against the budgets once it arrives;
+   the approval gate (for ``require_approval``), then the rate limits, then
+   the budgets before it is forwarded (a denied or still-pending call never
+   spends a token, a rate-limited call never spends budget, and an approval
+   is spent only by a call that is actually forwarded), and the reply's
+   tokens are booked against the budgets once it arrives;
    ``tools/list`` results are filtered on the way back, other
    requests are forwarded and answered, notifications and client responses
    are forwarded and acknowledged with ``202``;
 5. map every refusal and upstream failure onto a JSON-RPC error carrying the
-   request id. A single rate-limited or over-budget call also gets a
-   ``Retry-After`` header;
+   request id. A single rate-limited, over-budget or pending-approval call
+   also gets a ``Retry-After`` header;
    the HTTP status stays ``200`` because MCP clients read the JSON-RPC error.
 
 Batch entries are forwarded one by one (concurrently) rather than as a batch.
@@ -37,6 +39,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from mcp_warden.approval import ApprovalGate
 from mcp_warden.budget import BudgetEnforcer, Reservation
 from mcp_warden.identity import AuthenticationError, Authenticator
 from mcp_warden.jsonrpc import (
@@ -55,6 +58,7 @@ from mcp_warden.jsonrpc import (
     to_wire,
 )
 from mcp_warden.jsonrpc.mcp import Method, batching_allowed, parse_call_tool
+from mcp_warden.policy import Effect
 from mcp_warden.proxy.client import (
     PROTOCOL_HEADER,
     SESSION_HEADER,
@@ -100,8 +104,10 @@ class ProxyService:
         limits: ParseLimits | None = None,
         limiter: RateLimiter | None = None,
         budgets: BudgetEnforcer | None = None,
+        approvals: ApprovalGate | None = None,
     ) -> None:
         self.authenticator = authenticator
+        self.approvals = approvals
         self.limiter = limiter
         self.budgets = budgets
         self.registry = registry
@@ -186,13 +192,24 @@ class ProxyService:
                 # Validated first so malformed calls never reach the upstream and
                 # the policy sees a well-formed tool name and arguments object.
                 params = parse_call_tool(request)
-                self.guard.check_call(agent, upstream.name, params)
+                approval_id: str | None = None
+                if self.approvals is None:
+                    self.guard.check_call(agent, upstream.name, params)
+                else:
+                    decision = self.guard.evaluate_call(agent, upstream.name, params)
+                    if decision.effect is Effect.REQUIRE_APPROVAL:
+                        approval_id = await self.approvals.admit(
+                            agent, upstream.name, params.name, params.arguments, decision
+                        )
                 if self.limiter is not None:
                     await self.limiter.check_call(agent, upstream.name, params.name)
                 if self.budgets is not None:
                     reservation = await self.budgets.reserve(
                         agent, upstream.name, params.name, params.arguments
                     )
+                if self.approvals is not None and approval_id is not None:
+                    # Spent last, so a call refused by a limit keeps its approval.
+                    await self.approvals.claim(approval_id, upstream.name, params.name)
             reply = await self.transport.send(
                 upstream, to_wire(request), response_id=request.id, headers=forwarded
             )

@@ -2,23 +2,31 @@
 
 ``serve``, ``check`` and ``fake-upstream`` run the gateway and its tools;
 ``db``, ``agents`` and ``keys`` manage the identity database; ``usage``
-reports the budget usage ledger.
+reports the budget usage ledger; ``approvals`` lists and decides tool calls
+waiting for a human.
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import re
 import sys
 from collections.abc import Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from mcp_warden.approval import ApprovalStatus, ApprovalTimings
 from mcp_warden.config import Settings
 from mcp_warden.db import DatabaseNotReadyError
 from mcp_warden.identity import IdentityError, IdentityStore
 from mcp_warden.policy import PolicyEngine, PolicyError, ToolCallRequest, load_policy_file
 from mcp_warden.upstreams import UpstreamError
+
+if TYPE_CHECKING:
+    from mcp_warden.approval import DatabaseApprovalStore
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
@@ -157,6 +165,91 @@ def _cmd_usage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_approvals(args: argparse.Namespace) -> int:
+    from mcp_warden.approval import ApprovalError, DatabaseApprovalStore
+    from mcp_warden.db import ensure_schema_current, make_engine, make_sessionmaker
+
+    engine = make_engine(_database_url(args))
+    try:
+        ensure_schema_current(engine)
+        store = DatabaseApprovalStore(make_sessionmaker(engine))
+        return _APPROVAL_ACTIONS[args.approvals_command](store, args)
+    except (DatabaseNotReadyError, ApprovalError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+
+def _approvals_list(store: DatabaseApprovalStore, args: argparse.Namespace) -> int:
+    now = datetime.now(UTC)
+    status = None if args.status == "all" else ApprovalStatus(args.status)
+    print("id\tstatus\tagent\tserver/tool\trule\tcreated\texpires")
+    for r in store.list(now, status=status, agent=args.agent, limit=args.limit):
+        print(
+            f"{r.id}\t{r.state(now).value}\t{r.agent}\t{r.server}/{r.tool}\t{r.rule_id or '-'}"
+            f"\t{_fmt(r.created_at)}\t{_fmt(r.expires_at)}"
+        )
+    return 0
+
+
+def _approvals_show(store: DatabaseApprovalStore, args: argparse.Namespace) -> int:
+    request = store.get(args.id)
+    print(json.dumps(request.to_dict(datetime.now(UTC)), indent=2, sort_keys=True))
+    return 0
+
+
+def _approvals_decide(store: DatabaseApprovalStore, args: argparse.Namespace) -> int:
+    approve = args.approvals_command == "approve"
+    settings = Settings()
+    timings = ApprovalTimings(
+        pending_ttl=timedelta(seconds=settings.approval_ttl_seconds),
+        decision_ttl=timedelta(seconds=settings.approval_decision_ttl_seconds),
+    )
+    request = store.decide(
+        args.id,
+        approve=approve,
+        reviewer=args.reviewer,
+        note=args.note,
+        now=datetime.now(UTC),
+        timings=timings,
+    )
+    verb = "approved" if approve else "denied"
+    print(
+        f"{verb} {request.id}: {request.agent} -> {request.server}/{request.tool} "
+        f"(valid until {_fmt(request.expires_at)})"
+    )
+    return 0
+
+
+_APPROVAL_ACTIONS = {
+    "list": _approvals_list,
+    "show": _approvals_show,
+    "approve": _approvals_decide,
+    "deny": _approvals_decide,
+}
+
+
+def _default_reviewer() -> str:
+    try:
+        name = getpass.getuser()
+    except (KeyError, OSError):
+        return "cli"
+    return name if re.fullmatch(r"[A-Za-z0-9_.:@ -]{1,100}", name) else "cli"
+
+
+def _reviewer(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_.:@ -]{1,100}", value):
+        raise argparse.ArgumentTypeError("1-100 letters, digits, spaces or _.:@-")
+    return value
+
+
+def _note(value: str) -> str:
+    if len(value) > 500:
+        raise argparse.ArgumentTypeError("at most 500 characters")
+    return value
+
+
 def _fmt(ts: datetime | None) -> str:
     return ts.strftime("%Y-%m-%dT%H:%M:%SZ") if ts is not None else "-"
 
@@ -280,6 +373,33 @@ def _add_identity_commands(sub: argparse._SubParsersAction[argparse.ArgumentPars
     usage.add_argument("--all", action="store_true", help="include windows that have ended")
     usage.add_argument("--limit", type=_positive_int, default=100)
     usage.set_defaults(func=_cmd_usage)
+
+    approvals = sub.add_parser(
+        "approvals", help="review tool calls waiting for human approval (database store)"
+    )
+    approvals_sub = approvals.add_subparsers(dest="approvals_command", required=True)
+    alist = approvals_sub.add_parser("list", parents=[db_url], help="list approval requests")
+    alist.add_argument(
+        "--status",
+        choices=[*(s.value for s in ApprovalStatus), "all"],
+        default="pending",
+        help="filter by status (default: pending, i.e. the review queue)",
+    )
+    alist.add_argument("--agent", help="only this agent")
+    alist.add_argument("--limit", type=_positive_int, default=100)
+    show = approvals_sub.add_parser(
+        "show", parents=[db_url], help="show one request, including its arguments"
+    )
+    show.add_argument("id")
+    for verb in ("approve", "deny"):
+        p = approvals_sub.add_parser(verb, parents=[db_url], help=f"{verb} a pending request")
+        p.add_argument("id")
+        p.add_argument(
+            "--reviewer", type=_reviewer, default=_default_reviewer(), help="who decided"
+        )
+        p.add_argument("--note", type=_note, default=None, help="reason shown to the agent")
+    for p in (alist, show, *(approvals_sub.choices[v] for v in ("approve", "deny"))):
+        p.set_defaults(func=_cmd_approvals)
 
 
 def build_parser() -> argparse.ArgumentParser:

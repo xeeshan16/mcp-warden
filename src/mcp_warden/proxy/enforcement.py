@@ -43,8 +43,12 @@ class PolicyGuard:
     def __init__(self, engine: PolicyEngine) -> None:
         self.engine = engine
 
-    def check_call(self, agent: str, server: str, params: CallToolParams) -> Decision:
-        """Evaluate a ``tools/call``; raise a JSON-RPC error unless it is allowed."""
+    def evaluate_call(self, agent: str, server: str, params: CallToolParams) -> Decision:
+        """Evaluate a ``tools/call``; raise ``POLICY_DENIED`` for a deny.
+
+        Returns the decision otherwise, so the caller can route
+        ``require_approval`` to the approval gate.
+        """
         decision = self.engine.evaluate(
             ToolCallRequest(agent, server, params.name, params.arguments)
         )
@@ -54,6 +58,11 @@ class PolicyGuard:
                 f"tool call denied by policy: {params.name}",
                 _decision_data(decision, server, params.name),
             )
+        return decision
+
+    def check_call(self, agent: str, server: str, params: CallToolParams) -> Decision:
+        """Evaluate a ``tools/call``; raise a JSON-RPC error unless it is allowed."""
+        decision = self.evaluate_call(agent, server, params)
         if decision.effect is Effect.REQUIRE_APPROVAL:
             raise JsonRpcError(
                 ErrorCode.APPROVAL_REQUIRED,

@@ -68,6 +68,23 @@ rules:
     arguments:
       - {path: title, max_length: 120}
 
+  - id: urgent-tickets-need-a-human
+    effect: require_approval
+    description: An urgent ticket pages someone, so a person signs it off first.
+    agents: ["support-bot"]
+    servers: ["demo"]
+    tools: ["create_ticket"]
+    arguments:
+      - {path: priority, equals: urgent}
+
+# --- Human approval ----------------------------------------------------------
+# A call that ends up `require_approval` is parked as an approval request and
+# the agent gets error -32002 with an `approval_id`. A reviewer approves or
+# denies it (admin API or `mcp-warden approvals`), and the agent repeats the
+# identical call to collect the decision: approved calls run once, denied
+# ones get -32001 with the reviewer's note. Timeouts are runtime settings
+# (WARDEN_APPROVAL_*), not part of the policy.
+
 # --- Rate limits -------------------------------------------------------------
 # Token buckets on tools/call, checked after the rules (a denied call never
 # spends a token). `requests` per `per` (second, minute, hour, day) is the

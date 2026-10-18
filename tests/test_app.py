@@ -28,7 +28,7 @@ def test_policy_summary(client: TestClient) -> None:
     body = client.get("/v1/policy").json()
     assert body["version"] == 1
     assert body["default"] == "deny"
-    assert body["rule_count"] == 8
+    assert body["rule_count"] == 9
     assert "never-destructive" in body["rule_ids"]
 
 
