@@ -9,6 +9,12 @@ key (see :mod:`mcp_warden.identity.keys`).
 budget counter and fixed window (see :mod:`mcp_warden.budget`). Rows of past
 windows stay as history until the retention job removes them.
 
+``approval_requests`` holds tool calls parked for a human decision (see
+:mod:`mcp_warden.approval`). ``open_key`` carries the call's fingerprint while
+the request is open and is cleared when it reaches a final state; its unique
+constraint is what stops two concurrent identical calls from opening two
+requests (both databases allow any number of nulls in a unique column).
+
 ``rate_limit_buckets`` holds token buckets below capacity for the database
 rate-limit store (see :mod:`mcp_warden.ratelimit.database`); its times are
 epoch seconds because they feed arithmetic, not display.
@@ -30,6 +36,7 @@ from sqlalchemy import (
     Integer,
     MetaData,
     String,
+    Text,
     TypeDecorator,
 )
 from sqlalchemy.engine import Dialect
@@ -124,3 +131,28 @@ class UsageCounter(Base):
     calls: Mapped[int] = mapped_column(BigInteger)
     tokens: Mapped[int] = mapped_column(BigInteger)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class ApprovalRequestRow(Base):
+    __tablename__ = "approval_requests"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    # The fingerprint while the request is open (pending, approved, denied), else null.
+    open_key: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
+    fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    agent: Mapped[str] = mapped_column(String(200), index=True)
+    server: Mapped[str] = mapped_column(String(200))
+    tool: Mapped[str] = mapped_column(String(200))
+    rule_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    reason: Mapped[str] = mapped_column(String(500))
+    # Canonical JSON of the arguments for the reviewer; dropped once no longer needed.
+    arguments: Mapped[str | None] = mapped_column(Text, nullable=True)
+    arguments_digest: Mapped[str] = mapped_column(String(64))
+    arguments_size: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    decided_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    decided_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    note: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    executed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
