@@ -15,6 +15,10 @@ the request is open and is cleared when it reaches a final state; its unique
 constraint is what stops two concurrent identical calls from opening two
 requests (both databases allow any number of nulls in a unique column).
 
+``audit_events`` is the metadata-only audit log (see :mod:`mcp_warden.audit`):
+one append-only row per request, listed newest first through the
+``(occurred_at, id)`` index and removed by the retention job.
+
 ``rate_limit_buckets`` holds token buckets below capacity for the database
 rate-limit store (see :mod:`mcp_warden.ratelimit.database`); its times are
 epoch seconds because they feed arithmetic, not display.
@@ -33,6 +37,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     MetaData,
     String,
@@ -156,3 +161,25 @@ class ApprovalRequestRow(Base):
     decided_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     note: Mapped[str | None] = mapped_column(String(500), nullable=True)
     executed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+
+
+class AuditEventRow(Base):
+    __tablename__ = "audit_events"
+    __table_args__ = (Index("ix_audit_events_occurred_at_id", "occurred_at", "id"),)
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    agent: Mapped[str] = mapped_column(String(200), index=True)
+    server: Mapped[str] = mapped_column(String(200))
+    method: Mapped[str] = mapped_column(String(100))
+    tool: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    outcome: Mapped[str] = mapped_column(String(32), index=True)
+    effect: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    rule_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    approval_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    error_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tool_error: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    latency_ms: Mapped[float] = mapped_column(Float)
+    # Digest (HMAC when keyed) and byte size of the canonical arguments; never the arguments.
+    arguments_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    arguments_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
