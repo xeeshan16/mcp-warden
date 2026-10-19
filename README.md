@@ -6,7 +6,7 @@
 **A self-hosted policy, budget and audit gateway for AI agent tool calls over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).**
 
-> Status: under active development (day 8 of a 14-day build). See
+> Status: under active development (day 9 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md)
 > for the daily log. Features marked _planned_ are not implemented yet.
 
@@ -50,7 +50,9 @@ with a policy file you can review in a pull request.
 | Usage ledger in memory or the database, `mcp-warden usage` report | ✅ day 7 |
 | Human approval for `require_approval` calls: parked requests, single-use approvals, expiry | ✅ day 8 |
 | Admin API (`/v1/approvals`, bearer token) and `mcp-warden approvals` to review the queue | ✅ day 8 |
-| Metadata-only audit log (no payloads stored) | _planned_ |
+| Metadata-only audit log: one event per request, argument digest and size, never payloads | ✅ day 9 |
+| Audit query API (`GET /v1/audit`) and `mcp-warden audit`, with filters and cursor pagination | ✅ day 9 |
+| Retention job (`mcp-warden retention` or in the gateway) for audit, approvals, usage, buckets | ✅ day 9 |
 | Prometheus metrics and OpenTelemetry tracing | _planned_ |
 | PostgreSQL persistence, Docker Compose demo | _planned_ |
 
@@ -74,8 +76,9 @@ flowchart LR
 
 So far the policy engine (day 1), the JSON-RPC / MCP message layer (day 2), the proxy
 path to upstream servers (day 3), policy enforcement inside the proxy (day 4), agent
-authentication with API keys (day 5), rate limits (day 6), budgets (day 7) and human
-approval (day 8) are in place. The audit log lands next (see the plan).
+authentication with API keys (day 5), rate limits (day 6), budgets (day 7), human
+approval (day 8) and the audit log with its retention job (day 9) are in place. The full
+admin API lands next (see the plan).
 
 ### Policy resolution
 
@@ -387,6 +390,54 @@ client works without changes:
   8 threads against PostgreSQL for both; without the retry on the unique key, the same
   open race raised 26 integrity errors over 5 rounds.
 
+### Audit log
+
+Every JSON-RPC request the gateway routes to an upstream leaves one audit event,
+whatever happened to it: forwarded, denied, parked for approval, rate-limited, over
+budget, rejected as invalid, or failed upstream. An event holds **metadata only**:
+
+| Field | Meaning |
+| --- | --- |
+| `occurred_at`, `latency_ms` | when the request arrived and how long the gateway took to answer it |
+| `agent`, `server`, `method`, `tool` | who called what (`tool` for `tools/call` only) |
+| `outcome` | `forwarded`, `denied`, `approval_pending`, `rate_limited`, `budget_exhausted`, `upstream_error`, `invalid` or `error` |
+| `effect`, `rule_id`, `approval_id` | the policy decision and rule, and the approval request involved |
+| `error_code`, `tool_error` | the JSON-RPC error code of the answer (the gateway's or the upstream's), and the tool result's `isError` |
+| `arguments_digest`, `arguments_size` | a digest and the byte size of the canonical arguments |
+
+Arguments, results and error messages are never stored: they are where credentials and
+personal data end up. The digest still lets an investigator tell whether two calls had
+identical arguments, or check a call against arguments they already hold. A plain
+SHA-256 of a small argument object such as `{"confirm": true}` can be recovered by
+hashing guesses, so set `WARDEN_AUDIT_HASH_KEY` (16+ bytes) to make the digest an
+HMAC-SHA-256; without it the gateway logs a warning at startup.
+
+- **Never in the way.** The events of one HTTP request (one message or a whole batch)
+  are written in one transaction after the answers are ready. A failed write is
+  logged and counted, and the agent still gets its answer: an audit outage does not
+  become an agent outage. Notifications are not audited; they carry no decision.
+- **Where events live.** `WARDEN_AUDIT_STORE=memory` (default) keeps the newest
+  `WARDEN_AUDIT_MEMORY_MAX_EVENTS` (10,000) in process; `database` appends to the
+  `audit_events` table, shared by every gateway and readable from the CLI; `off`
+  disables auditing.
+- **Querying.** `GET /v1/audit` (admin token required) and `mcp-warden audit` list events
+  newest first, filtered by `agent`, `server`, `tool`, `method`, `outcome`, `since`
+  (inclusive) and `until` (exclusive). Pages use keyset pagination on
+  `(occurred_at, id)`: pass `next_cursor` back as `cursor`. Events written while
+  someone pages never shift or repeat entries, and every page is one index range scan
+  however deep it is.
+
+### Retention
+
+`mcp-warden retention` (for cron or a Kubernetes CronJob), or the gateway itself every
+`WARDEN_RETENTION_INTERVAL_SECONDS` (off by default), deletes history older than
+`WARDEN_RETENTION_DAYS` (30): audit events, approval requests that finished (executed,
+expired, or denied with the denial no longer in force), and budget counters of windows
+that ended. Rate-limit buckets that have refilled are deleted whatever their age, since
+a full bucket and a missing row mean the same thing. Each step is one `DELETE`, safe to
+run from several places at once; a failed run in the gateway is logged and retried at
+the next interval. The in-memory stores bound themselves and need no job.
+
 ### Agent identity
 
 Every request to `/mcp/{server}` is authenticated first; until it is, the gateway does
@@ -666,6 +717,41 @@ apr_05761497c50ebe50647a9d46	executed	support-bot	demo/create_ticket	urgent-tick
 
 The fake upstream logged two requests, `initialize` and the one approved ticket.
 
+### Query the audit log
+
+Output from a local run with both servers as above, a support-bot key,
+`WARDEN_AUDIT_STORE=database`, `WARDEN_AUDIT_HASH_KEY` and `WARDEN_ADMIN_TOKEN` set,
+and a fresh local PostgreSQL database in `WARDEN_DATABASE_URL`. After `initialize`, the
+agent created a ticket titled "Customer 4711 cannot log in", tried `delete_records`,
+asked for an urgent ticket, added two numbers and called `echo` without its argument:
+
+```text
+$ mcp-warden audit --limit 3
+time	agent	server/tool	outcome	rule	code	ms	args
+2026-10-19T10:04:36.238Z	support-bot	demo/echo	forwarded (isError)	demo-basics	-	4.5	9f69e91b55de..(2B)
+2026-10-19T10:04:36.216Z	support-bot	demo/add	forwarded	demo-basics	-	3.9	eb19a1a40644..(13B)
+2026-10-19T10:04:36.188Z	support-bot	demo/create_ticket	approval_pending	urgent-tickets-need-a-human	-32002	11.3	37b11b1a18b3..(48B)
+more: --cursor eyJ0IjoiMjAyNi0xMC0xOVQxMDowNDozNi4xODgxMDArMDA6MDAiLCJpZCI6ImV2dF83MGU5YzNlODhiYmQ4MDBmNGUzNDZjZjAifQ
+
+$ mcp-warden audit --limit 3 --cursor eyJ0IjoiMjAyNi0xMC0xOVQxMDowNDozNi4xODgxMDArMDA6MDAiLCJpZCI6ImV2dF83MGU5YzNlODhiYmQ4MDBmNGUzNDZjZjAifQ
+time	agent	server/tool	outcome	rule	code	ms	args
+2026-10-19T10:04:36.169Z	support-bot	demo/delete_records	denied	never-destructive	-32001	0.3	cba849695b61..(17B)
+2026-10-19T10:04:36.144Z	support-bot	demo/create_ticket	forwarded	support-bot-demo-tickets	-	5.6	510727722120..(39B)
+2026-10-19T10:04:36.108Z	support-bot	demo initialize	forwarded	-	-	9.7	-
+
+$ curl 'localhost:8080/v1/audit?tool=create_ticket&limit=1' -H "authorization: Bearer $WARDEN_ADMIN_TOKEN"
+{"events":[{"id":"evt_70e9c3e88bbd800f4e346cf0","occurred_at":"2026-10-19T10:04:36.188100+00:00","agent":"support-bot","server":"demo","method":"tools/call","tool":"create_ticket","outcome":"approval_pending","effect":"require_approval","rule_id":"urgent-tickets-need-a-human","approval_id":"apr_462fe9c1024714ef5345d681","error_code":-32002,"tool_error":null,"latency_ms":11.344,"arguments_digest":"37b11b1a18b35f75e90acdfbca7bd2b3c1d8f60a528a3c8bdbf84a15cd2356c7","arguments_size":48}],"next_cursor":"eyJ0IjoiMjAyNi0xMC0xOVQxMDowNDozNi4xODgxMDArMDA6MDAiLCJpZCI6ImV2dF83MGU5YzNlODhiYmQ4MDBmNGUzNDZjZjAifQ"}
+
+$ psql -c "select count(*) from audit_events a where row_to_json(a)::text like '%4711%'"
+ count 
+-------
+     0
+(1 row)
+
+$ mcp-warden retention --days 30
+removed 0 audit events, 0 approval requests and 0 usage counters older than 2026-09-19T10:04:45Z, and 0 refilled rate-limit buckets
+```
+
 Dry-run a call with arguments without any upstream:
 
 ```bash
@@ -680,7 +766,9 @@ Configuration is read from `WARDEN_*` environment variables (`WARDEN_POLICY_PATH
 (`memory` or `database`), `WARDEN_APPROVAL_TTL_SECONDS`,
 `WARDEN_APPROVAL_DECISION_TTL_SECONDS`, `WARDEN_APPROVAL_WAIT_SECONDS`,
 `WARDEN_APPROVAL_MAX_PENDING_PER_AGENT`, `WARDEN_APPROVAL_RETRY_AFTER_SECONDS` and
-`WARDEN_ADMIN_TOKEN`, `WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`, the parser
+`WARDEN_ADMIN_TOKEN`, the audit settings `WARDEN_AUDIT_STORE` (`memory`, `database` or
+`off`), `WARDEN_AUDIT_HASH_KEY` and `WARDEN_AUDIT_MEMORY_MAX_EVENTS`, the retention
+settings `WARDEN_RETENTION_DAYS` and `WARDEN_RETENTION_INTERVAL_SECONDS`, `WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`, the parser
 limits `WARDEN_MAX_MESSAGE_BYTES`, `WARDEN_MAX_JSON_DEPTH`, `WARDEN_MAX_BATCH_SIZE`, and
 `WARDEN_MAX_UPSTREAM_RESPONSE_BYTES`).
 
@@ -702,7 +790,8 @@ The database tests run on SQLite by default. Point `WARDEN_TEST_POSTGRES_URL` at
 throwaway PostgreSQL database (e.g.
 `postgresql+psycopg://warden:warden@localhost:5432/warden_test`, after
 `uv sync --extra postgres`) to also run them against PostgreSQL, including the
-concurrency tests for shared rate limits, budgets and approvals.
+concurrency tests for shared rate limits, budgets and approvals, and the audit store
+and retention tests.
 
 CI runs the same lint, type-check, test and build steps on every push, with a
 PostgreSQL 16 service so the PostgreSQL variants run too.

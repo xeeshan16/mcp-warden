@@ -299,3 +299,48 @@ repeat opened a new request, which was denied from the CLI; the fake upstream sa
 latency, argument hash and size, never payloads), query API with filters and cursor
 pagination, and a retention job (which also prunes ended budget windows, refilled
 rate-limit buckets and finished approval requests).
+
+## Day 9 — 2026-10-19: audit log and retention
+
+**Done**
+
+- `mcp_warden.audit`:
+  - `AuditEvent`: time, agent, server, method, tool, outcome (`forwarded`, `denied`,
+    `approval_pending`, `rate_limited`, `budget_exhausted`, `upstream_error`,
+    `invalid`, `error`), policy effect, rule id, approval id, JSON-RPC error code,
+    the tool result's `isError`, latency, and the arguments' digest and byte size.
+    Never arguments, results or error messages;
+  - `ArgumentHasher`: SHA-256 of canonical JSON, or HMAC-SHA-256 with
+    `WARDEN_AUDIT_HASH_KEY` (16+ bytes), so small argument objects cannot be recovered
+    by hashing guesses;
+  - `InMemoryAuditStore` (bounded ring) and `DatabaseAuditStore` (append-only
+    `audit_events`), both with filters (agent, server, tool, method, outcome,
+    since/until) and keyset pagination on `(occurred_at, id)` with opaque cursors;
+  - `AuditRecorder`: builds events from what the proxy learned about each request and
+    writes them in a worker thread; fail-open, with failures logged and counted.
+- Alembic revision `0005` (`audit_events`, composite `(occurred_at, id)` index).
+- Proxy: one event per JSON-RPC request routed to an upstream, including refusals and
+  a lost upstream session; the events of one HTTP request (a batch included) are
+  written in one transaction once every entry is answered.
+- `GET /v1/audit` behind the admin token; `mcp-warden audit` with the same filters,
+  `--cursor` paging and `--json`.
+- `mcp_warden.retention.RetentionJob`: prunes audit events, finished approval requests
+  (new `prune()` on both approval stores), ended budget windows and refilled rate-limit
+  buckets. Runs as `mcp-warden retention [--days N]` or inside the gateway every
+  `WARDEN_RETENTION_INTERVAL_SECONDS`; a failed run is logged and retried.
+- Settings: `WARDEN_AUDIT_STORE=memory|database|off`, `WARDEN_AUDIT_HASH_KEY`,
+  `WARDEN_AUDIT_MEMORY_MAX_EVENTS`, `WARDEN_RETENTION_DAYS`,
+  `WARDEN_RETENTION_INTERVAL_SECONDS`.
+
+**Tests:** 584 passing locally on SQLite (67 new) with 51 PostgreSQL variants skipped;
+634 passing with a local PostgreSQL 16, 99% line coverage (100% for the new modules).
+ruff, ruff format and strict mypy clean. New tests cover both stores against one
+contract (filters, newest-first order, paging with equal timestamps, writes during
+paging, pruning), the proxy end to end (every outcome, batches written once, a failing
+store not failing the call, no argument or result text anywhere in the events), the
+query API and CLI, and the retention job on SQLite and PostgreSQL. Verified by hand with
+both servers under uvicorn, API keys and the database stores on PostgreSQL (output in
+the README): a ticket title containing "4711" appears in no `audit_events` row.
+
+**Next (day 10):** admin API and CLI: manage agents, keys and policies (validated hot
+reload) over HTTP, approvals and usage views, admin authentication, CLI parity.

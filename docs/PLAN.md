@@ -82,3 +82,10 @@ composes them as a pipeline so a stage can short-circuit with a JSON-RPC error.
   API for approvals is protected by a single bearer token for now; per-reviewer admin
   identities and the rest of the admin API stay on day 10. Pruning finished approval
   requests is added to the day 9 retention job.
+- 2026-10-19: day 9 done as planned. Every request routed to an upstream is audited
+  (not only `tools/call`), so sessions and listings are visible too; notifications are
+  not. Argument digests are HMAC-SHA-256 when `WARDEN_AUDIT_HASH_KEY` is set, because a
+  plain hash of small arguments can be reversed by guessing. Audit writes are fail-open
+  (logged and counted); exposing the failure counter as a metric is part of day 11. The
+  retention job runs from the CLI or inside the gateway on an interval and also prunes
+  finished approval requests, ended budget windows and refilled rate-limit buckets.
