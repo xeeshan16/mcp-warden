@@ -3,7 +3,8 @@
 ``serve``, ``check`` and ``fake-upstream`` run the gateway and its tools;
 ``db``, ``agents`` and ``keys`` manage the identity database; ``usage``
 reports the budget usage ledger; ``approvals`` lists and decides tool calls
-waiting for a human.
+waiting for a human; ``audit`` queries the audit log and ``retention`` prunes
+old history.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mcp_warden.approval import ApprovalStatus, ApprovalTimings
+from mcp_warden.audit import Outcome
 from mcp_warden.config import Settings
 from mcp_warden.db import DatabaseNotReadyError
 from mcp_warden.identity import IdentityError, IdentityStore
@@ -222,6 +224,107 @@ def _approvals_decide(store: DatabaseApprovalStore, args: argparse.Namespace) ->
     return 0
 
 
+def _cmd_audit(args: argparse.Namespace) -> int:
+    from mcp_warden.audit import AuditQuery, Cursor, DatabaseAuditStore, InvalidCursorError
+    from mcp_warden.db import ensure_schema_current, make_engine, make_sessionmaker
+
+    try:
+        query = AuditQuery(
+            agent=args.agent,
+            server=args.server,
+            tool=args.tool,
+            method=args.method,
+            outcome=Outcome(args.outcome) if args.outcome else None,
+            since=args.since,
+            until=args.until,
+            cursor=Cursor.decode(args.cursor) if args.cursor else None,
+            limit=args.limit,
+        )
+    except InvalidCursorError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    engine = make_engine(_database_url(args))
+    try:
+        ensure_schema_current(engine)
+        page = DatabaseAuditStore(make_sessionmaker(engine)).query(query)
+    except DatabaseNotReadyError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+    if args.json:
+        print(json.dumps(page.to_dict(), indent=2))
+        return 0
+    print("time\tagent\tserver/tool\toutcome\trule\tcode\tms\targs")
+    for e in page.events:
+        target = f"{e.server}/{e.tool}" if e.tool is not None else f"{e.server} {e.method}"
+        digest = f"{e.arguments_digest[:12]}..({e.arguments_size}B)" if e.arguments_digest else "-"
+        print(
+            f"{e.occurred_at.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z\t{e.agent}\t{target}"
+            f"\t{e.outcome.value}{' (isError)' if e.tool_error else ''}"
+            f"\t{e.rule_id or '-'}\t{e.error_code or '-'}"
+            f"\t{e.latency_ms:.1f}\t{digest}"
+        )
+    if page.next_cursor:
+        print(f"more: --cursor {page.next_cursor}", file=sys.stderr)
+    return 0
+
+
+def _cmd_retention(args: argparse.Namespace) -> int:
+    from mcp_warden.approval import DatabaseApprovalStore
+    from mcp_warden.audit import DatabaseAuditStore
+    from mcp_warden.budget import DatabaseUsageStore
+    from mcp_warden.db import ensure_schema_current, make_engine, make_sessionmaker
+    from mcp_warden.ratelimit import DatabaseBucketStore
+    from mcp_warden.retention import RetentionJob
+
+    days: float = args.days if args.days is not None else Settings().retention_days
+    engine = make_engine(_database_url(args))
+    try:
+        ensure_schema_current(engine)
+        sessions = make_sessionmaker(engine)
+        report = RetentionJob(
+            timedelta(days=days),
+            audit=DatabaseAuditStore(sessions),
+            approvals=DatabaseApprovalStore(sessions),
+            usage=DatabaseUsageStore(sessions),
+            buckets=DatabaseBucketStore(sessions),
+        ).run()
+    except DatabaseNotReadyError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+    print(
+        f"removed {report.audit_events} audit events, {report.approval_requests} approval "
+        f"requests and {report.usage_counters} usage counters older than "
+        f"{_fmt(report.cutoff)}, and {report.rate_limit_buckets} refilled rate-limit buckets"
+    )
+    return 0
+
+
+def _aware_datetime(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "expected an ISO 8601 time, e.g. 2026-10-19T09:00Z"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise argparse.ArgumentTypeError("include a time zone, e.g. 2026-10-19T09:00Z")
+    return parsed.astimezone(UTC)
+
+
+def _positive_days(value: str) -> float:
+    try:
+        days = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a number of days") from exc
+    if not 0 < days <= 3650:
+        raise argparse.ArgumentTypeError("must be more than 0 and at most 3650")
+    return days
+
+
 _APPROVAL_ACTIONS = {
     "list": _approvals_list,
     "show": _approvals_show,
@@ -400,6 +503,35 @@ def _add_identity_commands(sub: argparse._SubParsersAction[argparse.ArgumentPars
         p.add_argument("--note", type=_note, default=None, help="reason shown to the agent")
     for p in (alist, show, *(approvals_sub.choices[v] for v in ("approve", "deny"))):
         p.set_defaults(func=_cmd_approvals)
+
+    audit = sub.add_parser(
+        "audit", parents=[db_url], help="query the audit log (database store), newest first"
+    )
+    audit.add_argument("--agent")
+    audit.add_argument("--server")
+    audit.add_argument("--tool")
+    audit.add_argument("--method", help="JSON-RPC method, e.g. tools/call")
+    audit.add_argument("--outcome", choices=[o.value for o in Outcome])
+    audit.add_argument("--since", type=_aware_datetime, help="inclusive, e.g. 2026-10-19T09:00Z")
+    audit.add_argument("--until", type=_aware_datetime, help="exclusive")
+    audit.add_argument("--cursor", help="continue from a previous page")
+    audit.add_argument("--limit", type=_positive_int, default=50)
+    audit.add_argument("--json", action="store_true", help="print the page as JSON")
+    audit.set_defaults(func=_cmd_audit)
+
+    retention = sub.add_parser(
+        "retention",
+        parents=[db_url],
+        help="delete old audit events, finished approvals, ended budget windows "
+        "and refilled rate-limit buckets",
+    )
+    retention.add_argument(
+        "--days",
+        type=_positive_days,
+        default=None,
+        help="keep this many days (WARDEN_RETENTION_DAYS)",
+    )
+    retention.set_defaults(func=_cmd_retention)
 
 
 def build_parser() -> argparse.ArgumentParser:

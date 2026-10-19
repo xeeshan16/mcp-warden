@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hmac
 import logging
 from collections.abc import AsyncIterator, Callable
@@ -24,6 +26,17 @@ from mcp_warden.approval import (
     DatabaseApprovalStore,
     InMemoryApprovalStore,
 )
+from mcp_warden.audit import (
+    ArgumentHasher,
+    AuditQuery,
+    AuditRecorder,
+    AuditStore,
+    Cursor,
+    DatabaseAuditStore,
+    InMemoryAuditStore,
+    InvalidCursorError,
+    Outcome,
+)
 from mcp_warden.budget import (
     BudgetEnforcer,
     CharRatioEstimator,
@@ -34,6 +47,7 @@ from mcp_warden.budget import (
 )
 from mcp_warden.config import (
     ApprovalStoreKind,
+    AuditStoreKind,
     AuthMode,
     RateLimitStore,
     Settings,
@@ -62,6 +76,7 @@ from mcp_warden.ratelimit import (
     InMemoryBucketStore,
     RateLimiter,
 )
+from mcp_warden.retention import RetentionJob
 from mcp_warden.upstreams import UpstreamRegistry, load_upstreams_file
 
 logger = logging.getLogger(__name__)
@@ -126,6 +141,17 @@ def get_gate(request: Request) -> ApprovalGate:
 GateDep = Annotated[ApprovalGate, Depends(get_gate)]
 
 
+def get_audit_store(request: Request) -> AuditStore:
+    store: AuditStore | None = request.app.state.audit_store
+    if store is None:
+        raise HTTPException(404, "audit log disabled: WARDEN_AUDIT_STORE=off")
+    return store
+
+
+AuditDep = Annotated[AuditStore, Depends(get_audit_store)]
+QueryName = Annotated[str | None, Query(max_length=200)]
+
+
 def require_admin(request: Request) -> None:
     """Admin endpoints need ``Authorization: Bearer $WARDEN_ADMIN_TOKEN``.
 
@@ -186,6 +212,8 @@ def create_app(
     budget_clock: Callable[[], datetime] | None = None,
     approval_store: ApprovalStore | None = None,
     approval_gate: ApprovalGate | None = None,
+    audit_store: AuditStore | None = None,
+    audit_clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     """Build the FastAPI app.
 
@@ -216,6 +244,7 @@ def create_app(
             and approval_store is None
             and settings.approval_store is ApprovalStoreKind.DATABASE
         )
+        or (audit_store is None and settings.audit_store is AuditStoreKind.DATABASE)
     ):
         db_engine = make_engine(settings.database_url)
         try:
@@ -258,6 +287,31 @@ def create_app(
             wait=timedelta(seconds=settings.approval_wait_seconds),
             retry_after=settings.approval_retry_after_seconds,
         )
+    if audit_store is None:
+        if settings.audit_store is AuditStoreKind.DATABASE and db_engine is not None:
+            audit_store = DatabaseAuditStore(make_sessionmaker(db_engine))
+        elif settings.audit_store is AuditStoreKind.MEMORY:
+            audit_store = InMemoryAuditStore(settings.audit_memory_max_events)
+    recorder = None
+    if audit_store is not None:
+        key = settings.audit_hash_key
+        recorder = AuditRecorder(
+            audit_store,
+            ArgumentHasher(key.get_secret_value().encode() if key is not None else None),
+            clock=audit_clock,
+        )
+        if key is None:
+            logger.warning(
+                "audit argument digests are plain SHA-256; set WARDEN_AUDIT_HASH_KEY "
+                "so that small arguments cannot be recovered by guessing"
+            )
+    retention = RetentionJob(
+        timedelta(days=settings.retention_days),
+        audit=audit_store,
+        approvals=approval_gate.store,
+        usage=usage_store if isinstance(usage_store, DatabaseUsageStore) else None,
+        buckets=bucket_store if isinstance(bucket_store, DatabaseBucketStore) else None,
+    )
     budgets = BudgetEnforcer(
         engine,
         usage_store,
@@ -273,13 +327,23 @@ def create_app(
         RateLimiter(engine, bucket_store),
         budgets,
         approval_gate,
+        recorder,
     )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        task = None
+        if settings.retention_interval_seconds > 0:
+            task = asyncio.create_task(
+                retention.run_periodically(settings.retention_interval_seconds)
+            )
         try:
             yield
         finally:
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             await transport.aclose()
             if db_engine is not None:
                 db_engine.dispose()
@@ -289,6 +353,9 @@ def create_app(
     app.state.engine = engine
     app.state.proxy = proxy
     app.state.approvals = approval_gate
+    app.state.audit_store = audit_store
+    app.state.audit = recorder
+    app.state.retention = retention
 
     @app.get("/healthz", tags=["ops"])
     def healthz() -> dict[str, str]:
@@ -371,6 +438,43 @@ def create_app(
         """Deny a pending request; repeats of the call are refused while the denial holds."""
         result: dict[str, Any] = _decide(gate, approval_id, body, False)
         return result
+
+    @app.get("/v1/audit", tags=["audit"], dependencies=[AdminDep])
+    def list_audit_events(
+        store: AuditDep,
+        agent: QueryName = None,
+        server: QueryName = None,
+        tool: QueryName = None,
+        method: Annotated[str | None, Query(max_length=100)] = None,
+        outcome: Outcome | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        cursor: Annotated[str | None, Query(max_length=300)] = None,
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    ) -> dict[str, Any]:
+        """Audit events newest first. Pass ``next_cursor`` back as ``cursor`` for the next page.
+
+        ``since`` is inclusive and ``until`` exclusive; both need a time zone
+        (``2026-10-19T09:00:00Z``).
+        """
+        for name, ts in (("since", since), ("until", until)):
+            if ts is not None and ts.tzinfo is None:
+                raise HTTPException(422, f"{name} must include a time zone, e.g. Z")
+        try:
+            query = AuditQuery(
+                agent=agent,
+                server=server,
+                tool=tool,
+                method=method,
+                outcome=outcome,
+                since=since,
+                until=until,
+                cursor=Cursor.decode(cursor) if cursor is not None else None,
+                limit=limit,
+            )
+        except InvalidCursorError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return store.query(query).to_dict()
 
     @app.post("/mcp/{server}", tags=["proxy"])
     async def mcp_post(server: str, request: Request, proxy: ProxyDep) -> Response:

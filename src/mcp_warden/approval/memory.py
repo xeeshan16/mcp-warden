@@ -141,6 +141,15 @@ class InMemoryApprovalStore:
         ]
         return matches[:limit]
 
+    def prune(self, before: datetime) -> int:
+        with self._lock:
+            finished = [r for r in self._requests.values() if _finished_at(r) < before]
+            for request in finished:
+                del self._requests[request.id]
+                if self._open.get(request.fingerprint) == request.id:
+                    del self._open[request.fingerprint]
+            return len(finished)
+
     def _finish(
         self, request: ApprovalRequest, status: ApprovalStatus, executed_at: datetime | None = None
     ) -> None:
@@ -162,3 +171,10 @@ class InMemoryApprovalStore:
             _, dropped = self._requests.popitem(last=False)
             if self._open.get(dropped.fingerprint) == dropped.id:
                 del self._open[dropped.fingerprint]
+
+
+def _finished_at(request: ApprovalRequest) -> datetime:
+    """When an executed request ran; for any other, when its window ends or ended."""
+    if request.status is ApprovalStatus.EXECUTED and request.executed_at is not None:
+        return request.executed_at
+    return request.expires_at

@@ -40,6 +40,15 @@ class ApprovalStoreKind(StrEnum):
     DATABASE = "database"
 
 
+class AuditStoreKind(StrEnum):
+    # Events in a bounded ring in process memory: recent history only.
+    MEMORY = "memory"
+    # Events in the database: durable, shared, queryable from the CLI.
+    DATABASE = "database"
+    # No audit log at all.
+    OFF = "off"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="WARDEN_", env_file=".env", extra="ignore")
 
@@ -99,6 +108,27 @@ class Settings(BaseSettings):
         default=None,
         description="Bearer token for the admin API (/v1/approvals); unset disables it.",
     )
+    audit_store: AuditStoreKind = Field(
+        default=AuditStoreKind.MEMORY, description="Where audit events are written."
+    )
+    audit_hash_key: SecretStr | None = Field(
+        default=None,
+        description="Key for HMAC digests of tool arguments in the audit log; unset: SHA-256.",
+    )
+    audit_memory_max_events: int = Field(
+        default=10_000, ge=1, description="Most events the in-memory audit store keeps."
+    )
+    retention_days: float = Field(
+        default=30,
+        gt=0,
+        le=3650,
+        description="How long audit events, finished approvals and ended budget windows are kept.",
+    )
+    retention_interval_seconds: float = Field(
+        default=0,
+        ge=0,
+        description="Run the retention job in the gateway this often; 0 leaves it to the CLI.",
+    )
     host: str = "127.0.0.1"
     port: int = Field(default=8080, ge=1, le=65535)
     log_level: str = "info"
@@ -117,6 +147,13 @@ class Settings(BaseSettings):
     def _strong_admin_token(cls, value: SecretStr | None) -> SecretStr | None:
         if value is not None and len(value.get_secret_value()) < 16:
             raise ValueError("WARDEN_ADMIN_TOKEN must be at least 16 characters")
+        return value
+
+    @field_validator("audit_hash_key")
+    @classmethod
+    def _strong_audit_key(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and len(value.get_secret_value().encode()) < 16:
+            raise ValueError("WARDEN_AUDIT_HASH_KEY must be at least 16 bytes")
         return value
 
     def parse_limits(self, *, allow_batch: bool = True) -> ParseLimits:

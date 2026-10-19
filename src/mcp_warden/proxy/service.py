@@ -16,7 +16,10 @@ Responsibilities, in order:
    ``tools/list`` results are filtered on the way back, other
    requests are forwarded and answered, notifications and client responses
    are forwarded and acknowledged with ``202``;
-5. map every refusal and upstream failure onto a JSON-RPC error carrying the
+5. record one metadata-only audit event per request (see
+   :mod:`mcp_warden.audit`); the events of one HTTP request are written
+   together once every entry has been answered;
+6. map every refusal and upstream failure onto a JSON-RPC error carrying the
    request id. A single rate-limited, over-budget or pending-approval call
    also gets a ``Retry-After`` header;
    the HTTP status stays ``200`` because MCP clients read the JSON-RPC error.
@@ -40,6 +43,8 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from mcp_warden.approval import ApprovalGate
+from mcp_warden.audit import AuditEvent, AuditRecorder, Outcome
+from mcp_warden.audit.recorder import Trace
 from mcp_warden.budget import BudgetEnforcer, Reservation
 from mcp_warden.identity import AuthenticationError, Authenticator
 from mcp_warden.jsonrpc import (
@@ -87,6 +92,7 @@ class _Outcome:
     response: UpstreamResponse | JsonRpcErrorResponse | None = None
     session_id: str | None = None
     retry_after: int | None = None
+    event: AuditEvent | None = None
 
 
 def forwarded_headers(headers: Mapping[str, str]) -> dict[str, str]:
@@ -105,7 +111,9 @@ class ProxyService:
         limiter: RateLimiter | None = None,
         budgets: BudgetEnforcer | None = None,
         approvals: ApprovalGate | None = None,
+        audit: AuditRecorder | None = None,
     ) -> None:
+        self.audit = audit
         self.authenticator = authenticator
         self.approvals = approvals
         self.limiter = limiter
@@ -139,13 +147,20 @@ class ProxyService:
         if not parsed.is_batch and isinstance(parsed.items[0], InvalidMessage):
             return ProxyResult(400, to_wire(parsed.items[0].error))
 
+        events: list[AuditEvent] = []
         try:
             outcomes = await asyncio.gather(
-                *(self._handle_item(agent, upstream, item, forwarded) for item in parsed.items)
+                *(
+                    self._handle_item(agent, upstream, item, forwarded, events)
+                    for item in parsed.items
+                )
             )
         except UpstreamSessionNotFoundError:
             # MCP: a 404 for a session id tells the client to re-initialise.
             return ProxyResult(404)
+        finally:
+            if self.audit is not None:
+                await self.audit.write(events)
 
         out_headers: dict[str, str] = {}
         session_id = next((o.session_id for o in outcomes if o.session_id), None)
@@ -163,12 +178,19 @@ class ProxyService:
         return ProxyResult(200, responses if parsed.is_batch else responses[0], out_headers)
 
     async def _handle_item(
-        self, agent: str, upstream: Upstream, item: ParsedItem, forwarded: Mapping[str, str]
+        self,
+        agent: str,
+        upstream: Upstream,
+        item: ParsedItem,
+        forwarded: Mapping[str, str],
+        events: list[AuditEvent],
     ) -> _Outcome:
         if isinstance(item, InvalidMessage):
             return _Outcome(item.error)
         if isinstance(item, JsonRpcRequest):
-            return await self._forward_request(agent, upstream, item, forwarded)
+            if self.audit is None:
+                return await self._forward_request(agent, upstream, item, forwarded)
+            return await self._audited_request(agent, upstream, item, forwarded, events)
         # Notifications and the agent's responses to server-initiated requests
         # have nobody to report a failure to, so failures end here.
         try:
@@ -179,12 +201,31 @@ class ProxyService:
             return _Outcome()
         return _Outcome(None, reply.session_id)
 
+    async def _audited_request(
+        self,
+        agent: str,
+        upstream: Upstream,
+        request: JsonRpcRequest,
+        forwarded: Mapping[str, str],
+        events: list[AuditEvent],
+    ) -> _Outcome:
+        assert self.audit is not None  # noqa: S101 - only called when auditing
+        trace = self.audit.start(agent, upstream.name, request.method)
+        try:
+            outcome = await self._forward_request(agent, upstream, request, forwarded, trace)
+        except UpstreamSessionNotFoundError:
+            events.append(self.audit.failed(trace, Outcome.UPSTREAM_ERROR))
+            raise
+        events.append(outcome.event or self.audit.failed(trace, Outcome.ERROR))
+        return outcome
+
     async def _forward_request(
         self,
         agent: str,
         upstream: Upstream,
         request: JsonRpcRequest,
         forwarded: Mapping[str, str],
+        trace: Trace | None = None,
     ) -> _Outcome:
         reservation: Reservation | None = None
         try:
@@ -192,15 +233,20 @@ class ProxyService:
                 # Validated first so malformed calls never reach the upstream and
                 # the policy sees a well-formed tool name and arguments object.
                 params = parse_call_tool(request)
+                if trace is not None and self.audit is not None:
+                    self.audit.note_arguments(trace, params.name, params.arguments)
                 approval_id: str | None = None
                 if self.approvals is None:
-                    self.guard.check_call(agent, upstream.name, params)
+                    decision = self.guard.check_call(agent, upstream.name, params)
                 else:
                     decision = self.guard.evaluate_call(agent, upstream.name, params)
                     if decision.effect is Effect.REQUIRE_APPROVAL:
                         approval_id = await self.approvals.admit(
                             agent, upstream.name, params.name, params.arguments, decision
                         )
+                if trace is not None:
+                    trace.effect, trace.rule_id = decision.effect.value, decision.rule_id
+                    trace.approval_id = approval_id
                 if self.limiter is not None:
                     await self.limiter.check_call(agent, upstream.name, params.name)
                 if self.budgets is not None:
@@ -218,8 +264,18 @@ class ProxyService:
                 await self.budgets.settle(reservation, response)
             if request.method == Method.TOOLS_LIST and isinstance(response, JsonRpcSuccess):
                 response = self.guard.filter_tools(agent, upstream.name, response)
-        except RetryAfterError as exc:
-            return _Outcome(error_response_from(exc, request.id), retry_after=exc.retry_after)
         except JsonRpcError as exc:
-            return _Outcome(error_response_from(exc, request.id))
-        return _Outcome(response, reply.session_id)
+            retry_after = exc.retry_after if isinstance(exc, RetryAfterError) else None
+            event = self._refused(trace, exc)
+            return _Outcome(
+                error_response_from(exc, request.id), retry_after=retry_after, event=event
+            )
+        event = None
+        if trace is not None and self.audit is not None:
+            event = self.audit.answered(trace, response)
+        return _Outcome(response, reply.session_id, event=event)
+
+    def _refused(self, trace: Trace | None, exc: JsonRpcError) -> AuditEvent | None:
+        if trace is None or self.audit is None:
+            return None
+        return self.audit.refused(trace, exc)

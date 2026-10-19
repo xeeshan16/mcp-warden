@@ -326,3 +326,27 @@ def test_postgres_an_approval_is_claimed_once(pg_store: DatabaseApprovalStore) -
     approve(pg_store, request.id)
     results = _race(8, lambda: DatabaseApprovalStore(pg_store._sessions).claim(request.id, T0))
     assert results.count(True) == 1
+
+
+def test_prune_removes_finished_requests_only(store: ApprovalStore) -> None:
+    pending = store.open(new(title="pending"), T0, TIMINGS)
+    denied = store.open(new(title="denied"), T0, TIMINGS)
+    store.decide(denied.id, approve=False, reviewer="a", note=None, now=T0, timings=TIMINGS)
+    executed = store.open(new(title="executed"), T0, TIMINGS)
+    approve(store, executed.id)
+    assert store.claim(executed.id, T0 + timedelta(minutes=1))
+    approved = store.open(new(title="approved"), T0, TIMINGS)
+    approve(store, approved.id)
+
+    # Nothing has finished long enough ago yet.
+    assert store.prune(T0) == 0
+    # Executed at +1m; decision windows end at +10m, the pending one at +15m.
+    assert store.prune(T0 + timedelta(minutes=2)) == 1
+    with pytest.raises(ApprovalNotFoundError):
+        store.get(executed.id)
+    assert store.prune(T0 + timedelta(minutes=11)) == 2  # the denial and the unused approval
+    assert store.get(pending.id).status is ApprovalStatus.PENDING
+    assert store.prune(T0 + timedelta(minutes=16)) == 1
+    assert store.list(T0 + timedelta(days=1)) == []
+    # The fingerprint was released with the request: the same call opens a new one.
+    assert store.open(new(title="pending"), T0 + timedelta(days=1), TIMINGS).id != pending.id

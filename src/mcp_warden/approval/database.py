@@ -23,7 +23,7 @@ from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import ColumnElement, and_, func, or_, select, update
+from sqlalchemy import ColumnElement, and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -173,6 +173,19 @@ class DatabaseApprovalStore:
         query = query.order_by(Row.created_at.desc(), Row.id.desc()).limit(limit)
         with self._sessions() as session:
             return [_snapshot(row) for row in session.scalars(query)]
+
+    def prune(self, before: datetime) -> int:
+        executed = ApprovalStatus.EXECUTED.value
+        with self._serialised(), self._sessions.begin() as session:
+            result = session.execute(
+                delete(Row).where(
+                    or_(
+                        and_(Row.status == executed, Row.executed_at < before),
+                        and_(Row.status != executed, Row.expires_at < before),
+                    )
+                )
+            )
+            return int(getattr(result, "rowcount", 0) or 0)
 
     def _open_once(
         self, new: NewApproval, now: datetime, timings: ApprovalTimings

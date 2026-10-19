@@ -86,3 +86,11 @@ class ApprovalStore(Protocol):
     ) -> list[ApprovalRequest]:
         """Requests newest first, filtered by their status as of ``now``."""
         ...
+
+    def prune(self, before: datetime) -> int:
+        """Delete requests that were finished before ``before``; returns how many.
+
+        A request is finished when it was executed, or when its pending or
+        decision window ended (expired, or a denial that no longer applies).
+        """
+        ...
