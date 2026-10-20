@@ -5,9 +5,10 @@ from __future__ import annotations
 from enum import StrEnum
 from pathlib import Path
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from mcp_warden.admin.auth import AdminAuthenticator
 from mcp_warden.jsonrpc.parser import ParseLimits
 
 
@@ -106,7 +107,16 @@ class Settings(BaseSettings):
     )
     admin_token: SecretStr | None = Field(
         default=None,
-        description="Bearer token for the admin API (/v1/approvals); unset disables it.",
+        description="Shared bearer token for the admin API; its holder is called 'admin'.",
+    )
+    admin_tokens: dict[str, SecretStr] = Field(
+        default_factory=dict,
+        description='Named admin tokens as a JSON object, e.g. {"alice": "..."}.',
+    )
+    policy_reload_interval_seconds: float = Field(
+        default=0,
+        ge=0,
+        description="Check the policy file for changes this often and reload it; 0 disables.",
     )
     audit_store: AuditStoreKind = Field(
         default=AuditStoreKind.MEMORY, description="Where audit events are written."
@@ -148,6 +158,22 @@ class Settings(BaseSettings):
         if value is not None and len(value.get_secret_value()) < 16:
             raise ValueError("WARDEN_ADMIN_TOKEN must be at least 16 characters")
         return value
+
+    @model_validator(mode="after")
+    def _valid_admin_tokens(self) -> Settings:
+        # Built once here so a bad name, a short or a reused token stops startup.
+        try:
+            self.admin_authenticator()
+        except ValueError as exc:
+            raise ValueError(f"WARDEN_ADMIN_TOKENS: {exc}") from exc
+        return self
+
+    def admin_authenticator(self) -> AdminAuthenticator:
+        shared = self.admin_token.get_secret_value() if self.admin_token is not None else None
+        return AdminAuthenticator(
+            {name: token.get_secret_value() for name, token in self.admin_tokens.items()},
+            shared,
+        )
 
     @field_validator("audit_hash_key")
     @classmethod

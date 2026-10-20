@@ -19,6 +19,8 @@ from mcp_warden.proxy import HttpUpstreamClient
 from mcp_warden.ratelimit import BucketStore
 from mcp_warden.upstreams import Upstream, UpstreamRegistry
 
+ADMIN_TOKEN = "admin-token-for-tests-only"  # noqa: S105 - test fixture, not a secret
+ADMIN_HEADERS = {"authorization": f"Bearer {ADMIN_TOKEN}"}
 EXAMPLE_POLICY = Path(__file__).resolve().parents[1] / "examples" / "policy.yaml"
 
 INIT = {

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -16,6 +15,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from mcp_warden import __version__
+from mcp_warden.admin import AdminAuthenticator, AdminPrincipal
 from mcp_warden.approval import (
     ApprovalConflictError,
     ApprovalGate,
@@ -110,7 +110,11 @@ class PolicySummary(BaseModel):
 
 
 class ReviewDecision(BaseModel):
-    reviewer: str = Field(pattern=r"^[A-Za-z0-9_.:@ -]{1,100}$", description="Who decided.")
+    reviewer: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9_.:@ -]{1,100}$",
+        description="Who decided. Taken from a named admin token; needed with the shared one.",
+    )
     note: str | None = Field(default=None, max_length=500)
 
 
@@ -152,25 +156,37 @@ AuditDep = Annotated[AuditStore, Depends(get_audit_store)]
 QueryName = Annotated[str | None, Query(max_length=200)]
 
 
-def require_admin(request: Request) -> None:
-    """Admin endpoints need ``Authorization: Bearer $WARDEN_ADMIN_TOKEN``.
+def require_admin(request: Request) -> AdminPrincipal:
+    """Admin endpoints need ``Authorization: Bearer <admin token>``.
 
     Without a configured token the admin API is switched off entirely, so a
-    gateway is never reviewable by anyone who can reach it by default.
+    gateway is never manageable by anyone who can reach it by default.
     """
-    settings: Settings = request.app.state.settings
-    if settings.admin_token is None:
-        raise HTTPException(503, "admin API disabled: set WARDEN_ADMIN_TOKEN")
-    supplied = bearer_token(request.headers)
-    expected = settings.admin_token.get_secret_value().encode()
-    if supplied is None or not hmac.compare_digest(supplied.encode(), expected):
+    admins: AdminAuthenticator = request.app.state.admins
+    if not admins.enabled:
+        raise HTTPException(
+            503, "admin API disabled: set WARDEN_ADMIN_TOKENS or WARDEN_ADMIN_TOKEN"
+        )
+    principal = admins.authenticate(bearer_token(request.headers))
+    if principal is None:
         raise HTTPException(
             401, "invalid or missing admin token", {"www-authenticate": ADMIN_REALM}
         )
+    return principal
 
 
 AdminDep = Depends(require_admin)
+Admin = Annotated[AdminPrincipal, AdminDep]
 ApprovalId = Annotated[str, Path(max_length=64)]
+
+
+def _reviewer(body: ReviewDecision, admin: AdminPrincipal) -> str:
+    """Named admins decide as themselves; the shared token names the reviewer."""
+    if admin.shared:
+        return body.reviewer or admin.name
+    if body.reviewer is not None and body.reviewer != admin.name:
+        raise HTTPException(403, f"{admin.name} cannot decide as {body.reviewer}")
+    return admin.name
 
 
 class _BodyTooLargeError(Exception):
@@ -350,6 +366,7 @@ def create_app(
 
     app = FastAPI(title="MCP Warden", version=__version__, lifespan=lifespan)
     app.state.settings = settings
+    app.state.admins = settings.admin_authenticator()
     app.state.engine = engine
     app.state.proxy = proxy
     app.state.approvals = approval_gate
@@ -361,7 +378,7 @@ def create_app(
     def healthz() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
 
-    @app.get("/v1/policy", response_model=PolicySummary, tags=["policy"])
+    @app.get("/v1/policy", response_model=PolicySummary, tags=["policy"], dependencies=[AdminDep])
     def policy_summary(engine: EngineDep) -> PolicySummary:
         policy = engine.policy
         return PolicySummary(
@@ -373,7 +390,12 @@ def create_app(
             budget_ids=[b.id for b in policy.budgets],
         )
 
-    @app.post("/v1/policy/evaluate", response_model=EvaluateResponse, tags=["policy"])
+    @app.post(
+        "/v1/policy/evaluate",
+        response_model=EvaluateResponse,
+        tags=["policy"],
+        dependencies=[AdminDep],
+    )
     def evaluate(body: EvaluateRequest, engine: EngineDep) -> EvaluateResponse:
         """Dry-run a decision without calling any upstream server."""
         decision = engine.evaluate(
@@ -405,12 +427,19 @@ def create_app(
         except ApprovalNotFoundError as exc:
             raise HTTPException(404, str(exc)) from exc
 
-    def _decide(gate: ApprovalGate, approval_id: str, body: ReviewDecision, approve: bool) -> Any:
+    def _decide(
+        gate: ApprovalGate,
+        approval_id: str,
+        body: ReviewDecision,
+        admin: AdminPrincipal,
+        approve: bool,
+    ) -> Any:
+        reviewer = _reviewer(body, admin)
         try:
             request = gate.store.decide(
                 approval_id,
                 approve=approve,
-                reviewer=body.reviewer,
+                reviewer=reviewer,
                 note=body.note,
                 now=gate.now(),
                 timings=gate.timings,
@@ -423,20 +452,24 @@ def create_app(
             "approval %s %s by %s",
             request.id,
             "approved" if approve else "denied",
-            body.reviewer,
+            reviewer,
         )
         return request.to_dict(gate.now())
 
-    @app.post("/v1/approvals/{approval_id}/approve", tags=["approvals"], dependencies=[AdminDep])
-    def approve(approval_id: ApprovalId, body: ReviewDecision, gate: GateDep) -> dict[str, Any]:
+    @app.post("/v1/approvals/{approval_id}/approve", tags=["approvals"])
+    def approve(
+        approval_id: ApprovalId, body: ReviewDecision, gate: GateDep, admin: Admin
+    ) -> dict[str, Any]:
         """Approve a pending request; the agent's next identical call goes through."""
-        result: dict[str, Any] = _decide(gate, approval_id, body, True)
+        result: dict[str, Any] = _decide(gate, approval_id, body, admin, True)
         return result
 
-    @app.post("/v1/approvals/{approval_id}/deny", tags=["approvals"], dependencies=[AdminDep])
-    def deny(approval_id: ApprovalId, body: ReviewDecision, gate: GateDep) -> dict[str, Any]:
+    @app.post("/v1/approvals/{approval_id}/deny", tags=["approvals"])
+    def deny(
+        approval_id: ApprovalId, body: ReviewDecision, gate: GateDep, admin: Admin
+    ) -> dict[str, Any]:
         """Deny a pending request; repeats of the call are refused while the denial holds."""
-        result: dict[str, Any] = _decide(gate, approval_id, body, False)
+        result: dict[str, Any] = _decide(gate, approval_id, body, admin, False)
         return result
 
     @app.get("/v1/audit", tags=["audit"], dependencies=[AdminDep])

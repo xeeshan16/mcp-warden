@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 
 from conftest import FakeClock, FakeMonotonic
-from gateway_helpers import EXAMPLE_POLICY, initialize, make_client, rpc
+from gateway_helpers import ADMIN_HEADERS, ADMIN_TOKEN, EXAMPLE_POLICY, initialize, make_client, rpc
 from mcp_warden.__main__ import main
 from mcp_warden.app import create_app
 from mcp_warden.budget import CharRatioEstimator, InMemoryUsageStore, Usage, canonical_json
@@ -261,8 +261,8 @@ def test_cli_usage_needs_a_migrated_database(
 
 
 def test_policy_summary_lists_budgets(day: FakeClock) -> None:
-    with gateway(day) as c:
-        body = c.get("/v1/policy").json()
+    with gateway(day, admin_token=ADMIN_TOKEN) as c:
+        body = c.get("/v1/policy", headers=ADMIN_HEADERS).json()
     assert body["budget_ids"] == ["hourly-calls", "echo-tokens"]
 
 

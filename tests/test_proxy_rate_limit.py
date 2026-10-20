@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 
 from conftest import FakeMonotonic
-from gateway_helpers import EXAMPLE_POLICY, initialize, make_client, rpc
+from gateway_helpers import ADMIN_HEADERS, ADMIN_TOKEN, EXAMPLE_POLICY, initialize, make_client, rpc
 from mcp_warden.__main__ import main
 from mcp_warden.app import create_app
 from mcp_warden.config import AuthMode, RateLimitStore, Settings
@@ -205,8 +205,8 @@ def test_database_store_requires_migrations(tmp_path: Path) -> None:
 
 
 def test_policy_summary_lists_limits(seconds: FakeMonotonic) -> None:
-    with gateway(seconds) as c:
-        body = c.get("/v1/policy").json()
+    with gateway(seconds, admin_token=ADMIN_TOKEN) as c:
+        body = c.get("/v1/policy", headers=ADMIN_HEADERS).json()
     assert body["rate_limit_ids"] == ["per-agent", "echo-per-tool"]
 
 

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from gateway_helpers import ADMIN_HEADERS, ADMIN_TOKEN
 from mcp_warden import __version__
 from mcp_warden.app import create_app
 from mcp_warden.config import AuthMode, Settings
@@ -15,7 +16,10 @@ EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "policy.yaml"
 
 @pytest.fixture
 def client() -> TestClient:
-    return TestClient(create_app(Settings(policy_path=EXAMPLE, auth_mode=AuthMode.TRUSTED_HEADER)))
+    settings = Settings(
+        policy_path=EXAMPLE, auth_mode=AuthMode.TRUSTED_HEADER, admin_token=ADMIN_TOKEN
+    )
+    return TestClient(create_app(settings), headers=ADMIN_HEADERS)
 
 
 def test_healthz(client: TestClient) -> None:
@@ -79,3 +83,13 @@ def test_broken_policy_fails_at_startup(tmp_path: Path) -> None:
     bad.write_text("version: 1\nrules:\n  - id: a\n    effect: nope\n", encoding="utf-8")
     with pytest.raises(PolicyError):
         create_app(Settings(policy_path=bad, auth_mode=AuthMode.TRUSTED_HEADER))
+
+
+@pytest.mark.parametrize(
+    ("method", "path"), [("get", "/v1/policy"), ("post", "/v1/policy/evaluate")]
+)
+def test_policy_endpoints_need_an_admin(client: TestClient, method: str, path: str) -> None:
+    payload = {"agent": "bot", "server": "github", "tool": "get_issue"}
+    kwargs: dict[str, object] = {"json": payload} if method == "post" else {}
+    resp = client.request(method, path, headers={"authorization": "Bearer nope"}, **kwargs)
+    assert resp.status_code == 401
