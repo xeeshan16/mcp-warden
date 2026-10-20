@@ -19,7 +19,6 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import anyio.to_thread
@@ -27,7 +26,14 @@ from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from mcp_warden.budget.ledger import Charge, Refusal, Usage, decide, unique_charges
+from mcp_warden.budget.ledger import (
+    Charge,
+    Refusal,
+    Usage,
+    UsageRecord,
+    decide,
+    unique_charges,
+)
 from mcp_warden.db.models import UsageCounter
 
 # Labels are for reports only (the digest identifies the counter), so long
@@ -41,20 +47,6 @@ def _label(value: str | None) -> str | None:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
-
-
-@dataclass(frozen=True, slots=True)
-class UsageRecord:
-    """One ledger row, for reports."""
-
-    budget_id: str
-    agent: str
-    server: str | None
-    tool: str | None
-    window_start: datetime
-    window_end: datetime
-    calls: int
-    tokens: int
 
 
 class DatabaseUsageStore:

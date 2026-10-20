@@ -74,6 +74,38 @@ class Usage:
 
 
 @dataclass(frozen=True, slots=True)
+class UsageRecord:
+    """One counter of the ledger, for reports."""
+
+    budget_id: str
+    agent: str
+    server: str | None
+    tool: str | None
+    window_start: datetime
+    window_end: datetime
+    calls: int
+    tokens: int
+
+    @classmethod
+    def of(cls, charge: Charge, usage: Usage) -> UsageRecord:
+        return cls(
+            charge.budget.id,
+            charge.agent,
+            charge.server,
+            charge.tool,
+            charge.window_start,
+            charge.window_end,
+            usage.calls,
+            usage.tokens,
+        )
+
+    @staticmethod
+    def sort_key(record: UsageRecord) -> tuple[float, str, str]:
+        """Newest window first, then agent and budget."""
+        return (-record.window_start.timestamp(), record.agent, record.budget_id)
+
+
+@dataclass(frozen=True, slots=True)
 class Refusal:
     """Why a call does not fit: the budget whose window resets last."""
 

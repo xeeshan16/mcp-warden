@@ -15,7 +15,9 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from mcp_warden import __version__
-from mcp_warden.admin import AdminAuthenticator, AdminPrincipal
+from mcp_warden.admin import AdminPrincipal
+from mcp_warden.admin.deps import Admin, AdminDep
+from mcp_warden.admin.routes import router as admin_router
 from mcp_warden.approval import (
     ApprovalConflictError,
     ApprovalGate,
@@ -59,7 +61,6 @@ from mcp_warden.identity import (
     Authenticator,
     IdentityStore,
     TrustedHeaderAuthenticator,
-    bearer_token,
 )
 from mcp_warden.jsonrpc import ErrorCode, error_response, to_wire
 from mcp_warden.policy import PolicyEngine, PolicyError, PolicyReloader, ToolCallRequest
@@ -142,9 +143,6 @@ class ReviewDecision(BaseModel):
     note: str | None = Field(default=None, max_length=500)
 
 
-ADMIN_REALM = 'Bearer realm="mcp-warden-admin"'
-
-
 def get_engine(request: Request) -> PolicyEngine:
     engine: PolicyEngine = request.app.state.engine
     return engine
@@ -180,27 +178,6 @@ AuditDep = Annotated[AuditStore, Depends(get_audit_store)]
 QueryName = Annotated[str | None, Query(max_length=200)]
 
 
-def require_admin(request: Request) -> AdminPrincipal:
-    """Admin endpoints need ``Authorization: Bearer <admin token>``.
-
-    Without a configured token the admin API is switched off entirely, so a
-    gateway is never manageable by anyone who can reach it by default.
-    """
-    admins: AdminAuthenticator = request.app.state.admins
-    if not admins.enabled:
-        raise HTTPException(
-            503, "admin API disabled: set WARDEN_ADMIN_TOKENS or WARDEN_ADMIN_TOKEN"
-        )
-    principal = admins.authenticate(bearer_token(request.headers))
-    if principal is None:
-        raise HTTPException(
-            401, "invalid or missing admin token", {"www-authenticate": ADMIN_REALM}
-        )
-    return principal
-
-
-AdminDep = Depends(require_admin)
-Admin = Annotated[AdminPrincipal, AdminDep]
 ApprovalId = Annotated[str, Path(max_length=64)]
 
 
@@ -296,15 +273,18 @@ def create_app(
         except Exception:
             db_engine.dispose()
             raise
+    identity = None
+    if settings.auth_mode is AuthMode.API_KEY and db_engine is not None:
+        identity = IdentityStore(make_sessionmaker(db_engine))
     if authenticator is None:
-        if settings.auth_mode is AuthMode.TRUSTED_HEADER or db_engine is None:
+        if identity is None:
             logger.warning(
                 "auth mode %s: agent identity is taken from X-Warden-Agent unchecked",
                 settings.auth_mode.value,
             )
             authenticator = TrustedHeaderAuthenticator()
         else:
-            authenticator = ApiKeyAuthenticator(IdentityStore(make_sessionmaker(db_engine)))
+            authenticator = ApiKeyAuthenticator(identity)
     if bucket_store is None:
         if settings.rate_limit_store is RateLimitStore.DATABASE and db_engine is not None:
             bucket_store = DatabaseBucketStore(make_sessionmaker(db_engine))
@@ -405,6 +385,8 @@ def create_app(
     app.state.policy_reloader = reloader
     app.state.proxy = proxy
     app.state.approvals = approval_gate
+    app.state.identity = identity
+    app.state.usage_store = usage_store
     app.state.audit_store = audit_store
     app.state.audit = recorder
     app.state.retention = retention
@@ -553,6 +535,8 @@ def create_app(
         except InvalidCursorError as exc:
             raise HTTPException(400, str(exc)) from exc
         return store.query(query).to_dict()
+
+    app.include_router(admin_router)
 
     @app.post("/mcp/{server}", tags=["proxy"])
     async def mcp_post(server: str, request: Request, proxy: ProxyDep) -> Response:

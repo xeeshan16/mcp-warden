@@ -1,6 +1,7 @@
 """Command-line entry point.
 
 ``serve``, ``check`` and ``fake-upstream`` run the gateway and its tools;
+``policy`` shows or reloads the policy of a running gateway over its admin API;
 ``db``, ``agents`` and ``keys`` manage the identity database; ``usage``
 reports the budget usage ledger; ``approvals`` lists and decides tool calls
 waiting for a human; ``audit`` queries the audit log and ``retention`` prunes
@@ -12,12 +13,16 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import logging
+import os
 import re
 import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import httpx
 
 from mcp_warden.approval import ApprovalStatus, ApprovalTimings
 from mcp_warden.audit import Outcome
@@ -95,7 +100,70 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     except (PolicyError, UpstreamError, DatabaseNotReadyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    # Uvicorn configures only its own loggers; without this the gateway's
+    # info messages (admin changes, policy reloads) would be dropped.
+    logging.basicConfig(format="%(levelname)s:     %(name)s: %(message)s")
+    logging.getLogger("mcp_warden").setLevel(settings.log_level.upper())
     uvicorn.run(app, host=settings.host, port=settings.port, log_level=settings.log_level)
+    return 0
+
+
+DEFAULT_GATEWAY = "http://127.0.0.1:8080"
+
+
+def _admin_client(base_url: str, token: str) -> httpx.Client:
+    return httpx.Client(
+        base_url=base_url, headers={"authorization": f"Bearer {token}"}, timeout=10.0
+    )
+
+
+def _cmd_policy(args: argparse.Namespace) -> int:
+    # The token comes from the environment only, so it never shows up in
+    # shell history or the process list.
+    token = os.environ.get("WARDEN_ADMIN_TOKEN")
+    if not token:
+        print("error: set WARDEN_ADMIN_TOKEN to an admin token", file=sys.stderr)
+        return 2
+    base_url = args.gateway or os.environ.get("WARDEN_GATEWAY_URL") or DEFAULT_GATEWAY
+    reload = args.policy_command == "reload"
+    try:
+        with _admin_client(base_url, token) as client:
+            resp = client.post("/v1/policy/reload") if reload else client.get("/v1/policy")
+    except httpx.HTTPError as exc:
+        print(f"error: cannot reach the gateway at {base_url}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {"detail": resp.text}
+    if resp.status_code != 200:
+        print(f"error: {resp.status_code}: {body.get('detail', body)}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(body, indent=2))
+        return 0
+    if reload:
+        if not body["changed"]:
+            print(f"unchanged: the file matches the policy in force ({body['sha256'][:12]})")
+            return 0
+        print(f"reloaded {body['sha256'][:12]}")
+        for section in ("rules", "rate_limits", "budgets"):
+            for verb, ids in body["changes"][section].items():
+                if ids:
+                    print(f"  {section.replace('_', ' ')} {verb}: {', '.join(ids)}")
+        if body["changes"]["default_changed"]:
+            print(f"  default is now {body['policy']['default']}")
+        return 0
+    source = body["source"]
+    print(
+        f"version {body['version']}, default {body['default']}, {body['rule_count']} rules, "
+        f"{len(body['rate_limit_ids'])} rate limits, {len(body['budget_ids'])} budgets"
+    )
+    print(
+        f"source {source['path']} ({(source['sha256'] or '-')[:12]}, loaded {source['loaded_at']})"
+    )
+    if source["last_error"]:
+        print(f"last reload failed: {source['last_error']}")
     return 0
 
 
@@ -560,6 +628,21 @@ def build_parser() -> argparse.ArgumentParser:
     fake.add_argument("--port", type=int, default=9001)
     fake.add_argument("--sse", action="store_true", help="answer with text/event-stream")
     fake.set_defaults(func=_cmd_fake_upstream)
+
+    policy = sub.add_parser(
+        "policy", help="show or reload the policy of a running gateway (admin API)"
+    )
+    policy_sub = policy.add_subparsers(dest="policy_command", required=True)
+    for verb, text in (
+        ("show", "show the policy in force and where it was loaded from"),
+        ("reload", "re-read the policy file; an invalid file is refused and reported"),
+    ):
+        p = policy_sub.add_parser(verb, help=text)
+        p.add_argument(
+            "--gateway", help=f"gateway URL (default: WARDEN_GATEWAY_URL or {DEFAULT_GATEWAY})"
+        )
+        p.add_argument("--json", action="store_true", help="print the response as JSON")
+        p.set_defaults(func=_cmd_policy)
 
     _add_identity_commands(sub)
     return parser

@@ -14,11 +14,18 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 
-from mcp_warden.budget.ledger import Charge, Refusal, Usage, decide, unique_charges
+from mcp_warden.budget.ledger import (
+    Charge,
+    Refusal,
+    Usage,
+    UsageRecord,
+    decide,
+    unique_charges,
+)
 
 DEFAULT_MAX_COUNTERS = 100_000
 
@@ -26,14 +33,28 @@ DEFAULT_MAX_COUNTERS = 100_000
 @dataclass(frozen=True, slots=True)
 class _Entry:
     usage: Usage
-    window_end: datetime
+    # The charge that created the counter: what reports show it as.
+    charge: Charge
+
+    @property
+    def window_end(self) -> datetime:
+        return self.charge.window_end
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 class InMemoryUsageStore:
-    def __init__(self, max_counters: int = DEFAULT_MAX_COUNTERS) -> None:
+    def __init__(
+        self,
+        max_counters: int = DEFAULT_MAX_COUNTERS,
+        clock: Callable[[], datetime] = _utcnow,
+    ) -> None:
         if max_counters < 1:
             raise ValueError("max_counters must be at least 1")
         self._max = max_counters
+        self._clock = clock
         self._entries: OrderedDict[tuple[str, datetime], _Entry] = OrderedDict()
         self._lock = threading.Lock()
 
@@ -67,7 +88,7 @@ class InMemoryUsageStore:
             for charge in charges:
                 used = current.get(charge.slot, Usage())
                 self._entries[charge.slot] = _Entry(
-                    Usage(used.calls + 1, used.tokens + tokens), charge.window_end
+                    Usage(used.calls + 1, used.tokens + tokens), charge
                 )
                 self._entries.move_to_end(charge.slot)
             if len(self._entries) > self._max:
@@ -88,6 +109,21 @@ class InMemoryUsageStore:
                 self._entries[charge.slot] = replace(
                     entry, usage=Usage(usage.calls, usage.tokens + tokens)
                 )
+
+    def records(
+        self, *, agent: str | None = None, current_only: bool = True, limit: int = 100
+    ) -> list[UsageRecord]:
+        """Counters, newest window first; by default only windows still open."""
+        now = self._clock()
+        with self._lock:
+            entries = list(self._entries.values())
+        records = [
+            UsageRecord.of(e.charge, e.usage)
+            for e in entries
+            if (agent is None or e.charge.agent == agent)
+            and (not current_only or e.window_end > now)
+        ]
+        return sorted(records, key=UsageRecord.sort_key)[:limit]
 
     def prune(self, now: datetime) -> int:
         """Forget counters of windows that have ended; returns how many."""

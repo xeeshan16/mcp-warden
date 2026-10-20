@@ -92,3 +92,19 @@ def test_identity_commands_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixt
 def test_expiry_must_be_positive(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         main(["keys", "issue", "bot", "--expires-in-days", "0"])
+
+
+def test_serve_shows_the_gateways_own_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+    import logging
+
+    import uvicorn
+
+    ran: list[dict[str, object]] = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: ran.append(kwargs))
+    monkeypatch.setenv("WARDEN_AUTH_MODE", "trusted-header")
+    monkeypatch.setenv("WARDEN_LOG_LEVEL", "info")
+    logger = logging.getLogger("mcp_warden")
+    monkeypatch.setattr(logger, "level", logger.level)
+    assert main(["serve", "--policy", str(EXAMPLE)]) == 0
+    assert ran == [{"host": "127.0.0.1", "port": 8080, "log_level": "info"}]
+    assert logger.getEffectiveLevel() == logging.INFO
