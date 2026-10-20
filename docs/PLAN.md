@@ -89,3 +89,12 @@ composes them as a pipeline so a stage can short-circuit with a JSON-RPC error.
   (logged and counted); exposing the failure counter as a metric is part of day 11. The
   retention job runs from the CLI or inside the gateway on an interval and also prunes
   finished approval requests, ended budget windows and refilled rate-limit buckets.
+- 2026-10-20: day 10 done as planned. Admin identity is a set of named bearer tokens
+  from configuration rather than a users table: it gives reviewers their own identity
+  without adding a login flow, and roles (read-only vs. admin) are left for later. The
+  policy stays a file reviewed in pull requests; the API reloads it (validated, with the
+  last good version kept on error) rather than accepting policy uploads, so the file
+  remains the source of truth. Policy summary and dry-run endpoints now need an admin.
+  The CLI keeps working directly on the database for agents, keys, approvals, usage and
+  audit, and talks to the gateway only for what lives in its memory (the policy in
+  force). Day 11 adds a metric for failed reloads and audit writes.

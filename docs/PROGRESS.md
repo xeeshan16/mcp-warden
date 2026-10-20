@@ -344,3 +344,51 @@ the README): a ticket title containing "4711" appears in no `audit_events` row.
 
 **Next (day 10):** admin API and CLI: manage agents, keys and policies (validated hot
 reload) over HTTP, approvals and usage views, admin authentication, CLI parity.
+
+## Day 10 — 2026-10-20: admin API, policy hot reload and admin identities
+
+**Done**
+
+- `mcp_warden.admin`:
+  - named admin tokens (`WARDEN_ADMIN_TOKENS`, a JSON object of name to token) next to
+    the shared `WARDEN_ADMIN_TOKEN` (called `admin`). Tokens are compared as SHA-256
+    digests against every configured entry; short, reused or badly named tokens stop
+    startup;
+  - approval decisions are recorded under the named admin who made them, and naming
+    another reviewer is `403`; the shared token still names the reviewer;
+  - `GET /v1/policy` and `POST /v1/policy/evaluate` now need an admin, as noted on day 5;
+  - agents (`GET/POST /v1/agents`, `GET /v1/agents/{name}`, `.../disable`, `.../enable`),
+    keys (`GET/POST /v1/agents/{name}/keys`, `POST /v1/keys/{prefix}/revoke`; the
+    plaintext only in the issuing response, with `Cache-Control: no-store`) and budget
+    usage (`GET /v1/usage`, from either usage store, with the limits of the policy in
+    force). Every change is logged with the admin's name.
+- `mcp_warden.policy.reload.PolicyReloader`: reads, validates and only then swaps a new
+  policy into the shared engine; a broken file is refused and the last good policy stays,
+  with the error shown in `GET /v1/policy`. Content is compared by SHA-256; the result
+  lists rules, rate limits and budgets added, removed or changed. Exposed as
+  `POST /v1/policy/reload`, as a file watcher (`WARDEN_POLICY_RELOAD_INTERVAL_SECONDS`)
+  and as `mcp-warden policy show | reload`, which reads the token from
+  `WARDEN_ADMIN_TOKEN` and the gateway from `--gateway` or `WARDEN_GATEWAY_URL`.
+- `PolicyEngine.replace()`, and every engine method now reads the policy once, so one
+  evaluation never mixes two versions.
+- `InMemoryUsageStore.records()`, so the usage view works without a database; the
+  `UsageRecord` type moved to the ledger module.
+- `mcp-warden serve` now configures the `mcp_warden` logger: uvicorn only configures its
+  own, so the gateway's info lines (admin changes, reloads) were silently dropped.
+
+**Tests:** 666 passing locally on SQLite (82 new) with 51 PostgreSQL variants skipped;
+716 passing with a local PostgreSQL 16, 99% line coverage (100% for `admin/` and
+`policy/reload.py`). ruff, ruff format, strict mypy and `uv build` clean. New tests cover
+the token comparison and configuration errors, reviewer identity, every admin endpoint's
+auth and error codes, onboarding an agent entirely over HTTP and using its key, disable,
+enable and revoke taking effect on the next request, usage counters before and after a
+reload removes their budget, reloads (valid, identical, cosmetic, five kinds of broken
+file, a missing file, the watcher, live sessions picking up a new rule) and the CLI
+against an in-process gateway. Verified by hand with both servers under uvicorn on
+PostgreSQL with two named admins (output in the README): an agent onboarded over HTTP,
+a rule added and reloaded from the CLI, a broken edit refused while the previous
+policy kept denying the call, and a revoked key answered with `401`.
+
+**Next (day 11):** observability: Prometheus metrics (decisions, latency, upstream
+errors, budget usage, audit write failures, policy reloads), OpenTelemetry tracing with
+an optional exporter, and structured JSON logs.

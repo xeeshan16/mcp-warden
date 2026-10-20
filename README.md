@@ -6,7 +6,7 @@
 **A self-hosted policy, budget and audit gateway for AI agent tool calls over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).**
 
-> Status: under active development (day 9 of a 14-day build). See
+> Status: under active development (day 10 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md)
 > for the daily log. Features marked _planned_ are not implemented yet.
 
@@ -53,6 +53,9 @@ with a policy file you can review in a pull request.
 | Metadata-only audit log: one event per request, argument digest and size, never payloads | ✅ day 9 |
 | Audit query API (`GET /v1/audit`) and `mcp-warden audit`, with filters and cursor pagination | ✅ day 9 |
 | Retention job (`mcp-warden retention` or in the gateway) for audit, approvals, usage, buckets | ✅ day 9 |
+| Admin API for agents, keys and budget usage (`/v1/agents`, `/v1/keys`, `/v1/usage`) | ✅ day 10 |
+| Named admin tokens; approval decisions recorded under the authenticated admin | ✅ day 10 |
+| Validated policy hot reload (`POST /v1/policy/reload`, `mcp-warden policy reload`, file watch) | ✅ day 10 |
 | Prometheus metrics and OpenTelemetry tracing | _planned_ |
 | PostgreSQL persistence, Docker Compose demo | _planned_ |
 
@@ -367,13 +370,12 @@ client works without changes:
 
 **Reviewing.** Two ways to see the queue and decide:
 
-- the admin API, enabled by setting `WARDEN_ADMIN_TOKEN` (at least 16 characters; the
-  API answers `503` while it is unset, and `401` to anything but
-  `Authorization: Bearer <token>`, compared in constant time):
+- the admin API (see [Admin API](#admin-api-and-policy-reload) for its tokens):
   `GET /v1/approvals?status=pending&agent=...`, `GET /v1/approvals/{id}`,
-  `POST /v1/approvals/{id}/approve` and `.../deny` with `{"reviewer": "...", "note": "..."}`.
-  Deciding a request that is not pending is `409`. Per-reviewer admin identities
-  arrive with the admin API on day 10; until then `reviewer` is recorded as given;
+  `POST /v1/approvals/{id}/approve` and `.../deny` with `{"note": "..."}`.
+  Deciding a request that is not pending is `409`. With a named admin token the decision
+  is recorded under that admin's name, and naming someone else as `reviewer` is `403`;
+  with the shared token, `reviewer` says who decided (default `admin`);
 - `mcp-warden approvals list | show <id> | approve <id> | deny <id>`, working directly
   on the database.
 
@@ -473,6 +475,65 @@ Not yet proxied: the optional `GET` stream for server-initiated messages and `DE
 session teardown (both answered with `405`, which MCP allows), and server-to-client
 messages interleaved on a POST's SSE stream, which are currently dropped.
 
+### Admin API and policy reload
+
+Everything under `/v1` is for operators and needs an admin token as
+`Authorization: Bearer <token>`. Two kinds exist, and with neither configured the admin
+API answers `503`, so a gateway is never manageable by whoever can reach it:
+
+- **Named tokens**, `WARDEN_ADMIN_TOKENS='{"alice": "...", "bob": "..."}'`: one per
+  person or system. The name is what approval decisions record and what the gateway
+  logs for every change, so a reviewer cannot sign as someone else.
+- **The shared token**, `WARDEN_ADMIN_TOKEN`: one token for a small setup; its holder is
+  called `admin` and names the reviewer per decision.
+
+Tokens must be at least 16 characters and distinct, and names are checked at startup.
+A supplied token is hashed with SHA-256 and compared against every configured digest
+with `hmac.compare_digest`, without stopping at the first match, so response times
+reveal neither which tokens exist nor how much of one was guessed. Agent API keys are
+never admin credentials.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /v1/policy` | The policy in force: rules, limits, budgets, and its source (path, SHA-256, load time, last reload error) |
+| `POST /v1/policy/evaluate` | Dry-run a decision without calling an upstream |
+| `POST /v1/policy/reload` | Re-read, validate and swap in the policy file; reports what changed |
+| `GET, POST /v1/agents` | List agents, register one (`{"name", "description"}`) |
+| `GET /v1/agents/{name}` | An agent with all its keys (prefix, status, expiry, last use) |
+| `POST /v1/agents/{name}/disable`, `.../enable` | Switch all of an agent's keys off or on, effective on the next request |
+| `GET, POST /v1/agents/{name}/keys` | List keys, issue one (`{"label", "expires_in_days"}`) |
+| `POST /v1/keys/{prefix}/revoke` | Revoke a key |
+| `GET /v1/usage?agent=&all=` | Budget counters (open windows unless `all=true`) with the limits of the policy in force |
+| `GET /v1/approvals`, `POST /v1/approvals/{id}/approve`, `.../deny` | The approval queue (see [Human approval](#human-approval)) |
+| `GET /v1/audit` | The audit log (see [Audit log](#audit-log)) |
+
+An issued key's plaintext appears once, in the response that creates it, sent with
+`Cache-Control: no-store`. The agent and key endpoints need the identity database
+(`WARDEN_AUTH_MODE=api-key`) and answer `404` in trusted-header mode. The CLI covers the
+same ground: `agents`, `keys`, `usage`, `approvals` and `audit` work directly on the
+database, and `mcp-warden policy show | reload` drives a running gateway, reading the
+token from `WARDEN_ADMIN_TOKEN` (never a flag, so it stays out of shell history) and the
+address from `--gateway` or `WARDEN_GATEWAY_URL`.
+
+**Reloading the policy.** Changing a rule should not drop every MCP session and parked
+approval, so the policy file can be reloaded into a running gateway:
+
+- A reload reads the file, validates all of it and only then swaps it in. A file that
+  does not parse or validate never replaces a working policy: the request fails with
+  `422` and the error, the gateway keeps enforcing the last good version, and
+  `GET /v1/policy` shows the failure until a later reload succeeds.
+- Files are compared by SHA-256 of their content, so an unchanged file is a no-op and a
+  `touch` is not a reload. The response lists the rules, rate limits and budgets that
+  were added, removed or changed, and whether the default changed.
+- `WARDEN_POLICY_RELOAD_INTERVAL_SECONDS` (off by default) makes the gateway check the
+  file itself, e.g. when a Kubernetes ConfigMap is updated in place. A failed check is
+  logged and the current policy stays.
+- The engine reads its policy once per evaluation, so a request is never judged against
+  a mix of two versions. The new policy applies from the next request, also in sessions
+  that are already open. Rate-limit buckets and budget counters are keyed by limit id,
+  so an edited limit keeps its consumption and a removed one stops counting; a parked
+  approval only matters if the new policy still requires approval for the call.
+
 ## Quick start
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
@@ -489,9 +550,11 @@ uv run mcp-warden check examples/policy.yaml \
 # Create the identity database (SQLite at ./mcp-warden.db unless WARDEN_DATABASE_URL is set)
 uv run mcp-warden db upgrade
 
-# Dry-run a decision over HTTP
+# Dry-run a decision over HTTP (the /v1 admin API needs an admin token)
+export WARDEN_ADMIN_TOKEN=$(openssl rand -hex 24)
 uv run mcp-warden serve --policy examples/policy.yaml
 curl -s localhost:8080/v1/policy/evaluate \
+  -H "authorization: Bearer $WARDEN_ADMIN_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"agent":"ci-bot","server":"github","tool":"create_pull_request"}'
 ```
@@ -752,6 +815,71 @@ $ mcp-warden retention --days 30
 removed 0 audit events, 0 approval requests and 0 usage counters older than 2026-09-19T10:04:45Z, and 0 refilled rate-limit buckets
 ```
 
+### Manage agents and reload the policy over HTTP
+
+Output from a local run with both servers as above, a copy of the example policy in
+`policy.yaml`, `WARDEN_USAGE_STORE=database`, two named admins in `WARDEN_ADMIN_TOKENS`
+(`alice` and `bob`) and a fresh local PostgreSQL database in `WARDEN_DATABASE_URL`. Alice
+onboards the support bot over HTTP (the key's secret part is elided here, and of the
+issuing response's headers only `cache-control` is shown):
+
+```text
+$ curl -X POST localhost:8080/v1/agents -H "authorization: Bearer $ALICE_TOKEN" \
+    -H 'content-type: application/json' -d '{"name":"support-bot","description":"Tier 1 support"}'
+{"name":"support-bot","description":"Tier 1 support","disabled":false,"created_at":"2026-10-20T10:06:49Z"}
+
+$ curl -i -X POST localhost:8080/v1/agents/support-bot/keys -H "authorization: Bearer $ALICE_TOKEN" \
+    -H 'content-type: application/json' -d '{"label":"prod","expires_in_days":90}'
+cache-control: no-store
+{"agent":"support-bot","prefix":"636145edb614","label":"prod","status":"active","created_at":"2026-10-20T10:06:49Z","expires_at":"2027-01-18T10:06:49Z","revoked_at":null,"last_used_at":null,"key":"mcpw_636145edb…"}
+
+$ tools/call echo {"text": "hello"} (twice, with the new key)
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello"}],"isError":false}} [HTTP 200]
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello"}],"isError":false}} [HTTP 200]
+
+$ curl localhost:8080/v1/usage -H "authorization: Bearer $ALICE_TOKEN"
+{"usage":[{"budget":"demo-echo","agent":"support-bot","server":"demo","tool":"echo","window_start":"2026-10-20T10:00:00Z","window_end":"2026-10-20T11:00:00Z","calls":2,"tokens":52,"max_calls":50,"max_tokens":5000},{"budget":"daily-calls","agent":"support-bot","server":null,"tool":null,"window_start":"2026-10-20T00:00:00Z","window_end":"2026-10-21T00:00:00Z","calls":2,"tokens":52,"max_calls":2000,"max_tokens":null},{"budget":"support-bot-tokens","agent":"support-bot","server":null,"tool":null,"window_start":"2026-10-20T00:00:00Z","window_end":"2026-10-21T00:00:00Z","calls":2,"tokens":52,"max_calls":null,"max_tokens":200000}]}
+```
+
+During an incident Bob adds a rule denying `echo` to the file and reloads it from the
+CLI (`WARDEN_ADMIN_TOKEN` holds his token). `policy show` still reports the version in
+force until the reload:
+
+```text
+$ mcp-warden policy show
+version 1, default deny, 9 rules, 3 rate limits, 3 budgets
+source policy.yaml (aac81c906083, loaded 2026-10-20T10:06:26Z)
+$ mcp-warden policy reload   # after adding rule echo-off-during-incident
+reloaded 1a932150d0f2
+  rules added: echo-off-during-incident
+```
+
+A later edit has a typo. The reload is refused, the previous policy stays in force and
+the failure is visible to anyone who looks. Alice then revokes a second key she had
+issued (`demo-2`):
+
+```text
+$ tools/call echo {"text": "hello"}
+{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"tool call denied by policy: echo","data":{"server":"demo","tool":"echo","effect":"deny","rule_id":"echo-off-during-incident","reason":"Echo is switched off while INC-42 is investigated."}}} [HTTP 200]
+$ mcp-warden policy reload   # after a typo: effect: block
+error: 422: invalid policy: rules.5.effect: Input should be 'allow', 'require_approval' or 'deny'
+$ mcp-warden policy show
+version 1, default deny, 10 rules, 3 rate limits, 3 budgets
+source policy.yaml (1a932150d0f2, loaded 2026-10-20T10:07:01Z)
+last reload failed: invalid policy: rules.5.effect: Input should be 'allow', 'require_approval' or 'deny'
+$ tools/call echo {"text": "hello"}
+{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"tool call denied by policy: echo","data":{"server":"demo","tool":"echo","effect":"deny","rule_id":"echo-off-during-incident","reason":"Echo is switched off while INC-42 is investigated."}}} [HTTP 200]
+$ curl -X POST localhost:8080/v1/keys/14244387657f/revoke -H "authorization: Bearer $ALICE_TOKEN"
+{"agent":"support-bot","prefix":"14244387657f","label":"demo-2","status":"revoked","created_at":"2026-10-20T10:07:19Z","expires_at":null,"revoked_at":"2026-10-20T10:07:21Z","last_used_at":"2026-10-20T10:07:19Z"}
+$ initialize with the revoked key
+{"jsonrpc":"2.0","id":null,"error":{"code":-32008,"message":"invalid, expired or revoked API key"}} [HTTP 401]
+$ curl localhost:8080/v1/agents/support-bot -H "authorization: Bearer $ALICE_TOKEN"
+{"name":"support-bot","description":"Tier 1 support","disabled":false,"created_at":"2026-10-20T10:06:49Z","keys":[{"agent":"support-bot","prefix":"636145edb614","label":"prod","status":"active","created_at":"2026-10-20T10:06:49Z","expires_at":"2027-01-18T10:06:49Z","revoked_at":null,"last_used_at":"2026-10-20T10:06:49Z"},{"agent":"support-bot","prefix":"14244387657f","label":"demo-2","status":"revoked","created_at":"2026-10-20T10:07:19Z","expires_at":null,"revoked_at":"2026-10-20T10:07:21Z","last_used_at":"2026-10-20T10:07:19Z"}]}
+```
+
+The fake upstream logged six requests: four `initialize` calls and the two allowed
+`echo` calls. Neither denied call reached it.
+
 Dry-run a call with arguments without any upstream:
 
 ```bash
@@ -765,8 +893,9 @@ Configuration is read from `WARDEN_*` environment variables (`WARDEN_POLICY_PATH
 `database`), `WARDEN_CHARS_PER_TOKEN`, the approval settings `WARDEN_APPROVAL_STORE`
 (`memory` or `database`), `WARDEN_APPROVAL_TTL_SECONDS`,
 `WARDEN_APPROVAL_DECISION_TTL_SECONDS`, `WARDEN_APPROVAL_WAIT_SECONDS`,
-`WARDEN_APPROVAL_MAX_PENDING_PER_AGENT`, `WARDEN_APPROVAL_RETRY_AFTER_SECONDS` and
-`WARDEN_ADMIN_TOKEN`, the audit settings `WARDEN_AUDIT_STORE` (`memory`, `database` or
+`WARDEN_APPROVAL_MAX_PENDING_PER_AGENT` and `WARDEN_APPROVAL_RETRY_AFTER_SECONDS`, the
+admin tokens `WARDEN_ADMIN_TOKENS` (named, as JSON) and `WARDEN_ADMIN_TOKEN` (shared),
+`WARDEN_POLICY_RELOAD_INTERVAL_SECONDS`, the audit settings `WARDEN_AUDIT_STORE` (`memory`, `database` or
 `off`), `WARDEN_AUDIT_HASH_KEY` and `WARDEN_AUDIT_MEMORY_MAX_EVENTS`, the retention
 settings `WARDEN_RETENTION_DAYS` and `WARDEN_RETENTION_INTERVAL_SECONDS`, `WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`, the parser
 limits `WARDEN_MAX_MESSAGE_BYTES`, `WARDEN_MAX_JSON_DEPTH`, `WARDEN_MAX_BATCH_SIZE`, and
