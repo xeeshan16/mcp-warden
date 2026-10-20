@@ -62,7 +62,7 @@ from mcp_warden.identity import (
     bearer_token,
 )
 from mcp_warden.jsonrpc import ErrorCode, error_response, to_wire
-from mcp_warden.policy import PolicyEngine, ToolCallRequest, load_policy_file
+from mcp_warden.policy import PolicyEngine, PolicyError, PolicyReloader, ToolCallRequest
 from mcp_warden.proxy import (
     HttpUpstreamClient,
     PolicyGuard,
@@ -100,6 +100,16 @@ class EvaluateResponse(BaseModel):
     matched_rule_ids: list[str]
 
 
+class PolicySource(BaseModel):
+    path: str
+    sha256: str | None
+    loaded_at: str | None
+    last_checked_at: str | None
+    last_error: str | None = Field(description="Why the last reload failed, if it did.")
+    reloads: int
+    failed_reloads: int
+
+
 class PolicySummary(BaseModel):
     version: int
     default: str
@@ -107,6 +117,20 @@ class PolicySummary(BaseModel):
     rule_ids: list[str]
     rate_limit_ids: list[str]
     budget_ids: list[str]
+    source: PolicySource
+
+
+def _summary(engine: PolicyEngine, reloader: PolicyReloader) -> PolicySummary:
+    policy = engine.policy
+    return PolicySummary(
+        version=policy.version,
+        default=policy.default.value,
+        rule_count=len(policy.rules),
+        rule_ids=[r.id for r in policy.rules],
+        rate_limit_ids=[r.id for r in policy.rate_limits],
+        budget_ids=[b.id for b in policy.budgets],
+        source=PolicySource(**reloader.status()),
+    )
 
 
 class ReviewDecision(BaseModel):
@@ -239,7 +263,11 @@ def create_app(
     the first request.
     """
     settings = settings or Settings()
-    engine = engine or PolicyEngine(load_policy_file(settings.policy_path))
+    if engine is None:
+        reloader = PolicyReloader.from_file(settings.policy_path)
+        engine = reloader.engine
+    else:
+        reloader = PolicyReloader(engine, settings.policy_path)
     if upstreams is None:
         upstreams = (
             load_upstreams_file(settings.upstreams_path)
@@ -348,15 +376,21 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        task = None
+        tasks = []
         if settings.retention_interval_seconds > 0:
-            task = asyncio.create_task(
-                retention.run_periodically(settings.retention_interval_seconds)
+            tasks.append(
+                asyncio.create_task(retention.run_periodically(settings.retention_interval_seconds))
+            )
+        if settings.policy_reload_interval_seconds > 0:
+            tasks.append(
+                asyncio.create_task(
+                    reloader.run_periodically(settings.policy_reload_interval_seconds)
+                )
             )
         try:
             yield
         finally:
-            if task is not None:
+            for task in tasks:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
@@ -368,6 +402,7 @@ def create_app(
     app.state.settings = settings
     app.state.admins = settings.admin_authenticator()
     app.state.engine = engine
+    app.state.policy_reloader = reloader
     app.state.proxy = proxy
     app.state.approvals = approval_gate
     app.state.audit_store = audit_store
@@ -380,15 +415,25 @@ def create_app(
 
     @app.get("/v1/policy", response_model=PolicySummary, tags=["policy"], dependencies=[AdminDep])
     def policy_summary(engine: EngineDep) -> PolicySummary:
-        policy = engine.policy
-        return PolicySummary(
-            version=policy.version,
-            default=policy.default.value,
-            rule_count=len(policy.rules),
-            rule_ids=[r.id for r in policy.rules],
-            rate_limit_ids=[r.id for r in policy.rate_limits],
-            budget_ids=[b.id for b in policy.budgets],
-        )
+        """The policy in force and where it came from, including a failed reload."""
+        return _summary(engine, reloader)
+
+    @app.post("/v1/policy/reload", tags=["policy"])
+    def reload_policy(admin: Admin) -> dict[str, Any]:
+        """Re-read the policy file, validate it and swap it in.
+
+        An invalid file is refused with 422 and the current policy stays in force.
+        """
+        try:
+            result = reloader.reload()
+        except PolicyError as exc:
+            logger.warning("policy reload by %s refused: %s", admin.name, exc)
+            raise HTTPException(422, str(exc)) from exc
+        if result.changed:
+            logger.info("policy reload requested by %s applied", admin.name)
+        body = result.to_dict()
+        body["policy"] = _summary(reloader.engine, reloader).model_dump()
+        return body
 
     @app.post(
         "/v1/policy/evaluate",

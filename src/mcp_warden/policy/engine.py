@@ -154,8 +154,23 @@ def rule_matches(rule: Rule, request: ToolCallRequest) -> bool:
     return all(matcher_holds(m, arguments) for m in rule.arguments)
 
 
+def _always_denied(policy: Policy, agent: str, server: str, tool: str) -> bool:
+    probe = ToolCallRequest(agent, server, tool)
+    candidates = [r for r in policy.rules if _identity_matches(r, probe)]
+    if any(r.effect is Effect.DENY and not r.conditional for r in candidates):
+        return True
+    if any(r.effect is not Effect.DENY for r in candidates):
+        return False
+    return policy.default is Effect.DENY
+
+
 class PolicyEngine:
-    """Evaluates tool-call requests against an immutable policy."""
+    """Evaluates tool-call requests against the current policy.
+
+    Policies are immutable; a reload swaps in a new one with :meth:`replace`.
+    Every method reads the policy once, so one evaluation never mixes rules
+    from two versions.
+    """
 
     def __init__(self, policy: Policy) -> None:
         self._policy = policy
@@ -164,13 +179,19 @@ class PolicyEngine:
     def policy(self) -> Policy:
         return self._policy
 
+    def replace(self, policy: Policy) -> Policy:
+        """Swap in a new, already validated policy; returns the previous one."""
+        previous, self._policy = self._policy, policy
+        return previous
+
     def evaluate(self, request: ToolCallRequest) -> Decision:
-        matched = [rule for rule in self._policy.rules if rule_matches(rule, request)]
+        policy = self._policy
+        matched = [rule for rule in policy.rules if rule_matches(rule, request)]
         if not matched:
             return Decision(
-                effect=self._policy.default,
+                effect=policy.default,
                 rule_id=None,
-                reason=f"no rule matched; default is {self._policy.default.value}",
+                reason=f"no rule matched; default is {policy.default.value}",
             )
 
         winner = max(matched, key=lambda r: r.effect.precedence)
@@ -192,13 +213,7 @@ class PolicyEngine:
         the default is ``deny``. Every call is still checked with its real
         arguments, so this only decides what the agent is shown.
         """
-        probe = ToolCallRequest(agent, server, tool)
-        candidates = [r for r in self._policy.rules if _identity_matches(r, probe)]
-        if any(r.effect is Effect.DENY and not r.conditional for r in candidates):
-            return True
-        if any(r.effect is not Effect.DENY for r in candidates):
-            return False
-        return self._policy.default is Effect.DENY
+        return _always_denied(self._policy, agent, server, tool)
 
     def visible_tools(self, agent: str, server: str, tools: list[str]) -> list[str]:
         """Filter a tool listing down to tools the agent could ever invoke.
@@ -206,7 +221,8 @@ class PolicyEngine:
         Tools that would be denied outright are hidden; tools that need approval
         stay visible so the agent can request them.
         """
-        return [tool for tool in tools if not self.always_denied(agent, server, tool)]
+        policy = self._policy
+        return [tool for tool in tools if not _always_denied(policy, agent, server, tool)]
 
     def rate_limits_for(self, agent: str, server: str, tool: str) -> list[RateLimit]:
         """Every rate limit that applies to a call, in document order."""

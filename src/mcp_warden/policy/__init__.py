@@ -13,6 +13,7 @@ from mcp_warden.policy.model import (
     RateLimit,
     Rule,
 )
+from mcp_warden.policy.reload import PolicyChanges, PolicyReloader, ReloadResult
 
 __all__ = [
     "ArgumentMatcher",
@@ -23,9 +24,12 @@ __all__ = [
     "LimitScope",
     "Period",
     "Policy",
+    "PolicyChanges",
     "PolicyEngine",
     "PolicyError",
+    "PolicyReloader",
     "RateLimit",
+    "ReloadResult",
     "Rule",
     "ToolCallRequest",
     "load_policy",
