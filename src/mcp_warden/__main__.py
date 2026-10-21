@@ -14,6 +14,7 @@ import argparse
 import getpass
 import json
 import logging
+import logging.config
 import os
 import re
 import sys
@@ -29,6 +30,8 @@ from mcp_warden.audit import Outcome
 from mcp_warden.config import Settings
 from mcp_warden.db import DatabaseNotReadyError
 from mcp_warden.identity import IdentityError, IdentityStore
+from mcp_warden.observability.logs import logging_config
+from mcp_warden.observability.tracing import TracingUnavailableError
 from mcp_warden.policy import PolicyEngine, PolicyError, ToolCallRequest, load_policy_file
 from mcp_warden.upstreams import UpstreamError
 
@@ -95,16 +98,21 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     if args.upstreams:
         overrides["upstreams_path"] = args.upstreams
     settings = Settings(**overrides)  # type: ignore[arg-type]
+    log_config = logging_config(settings.log_level, settings.log_format)
+    # Applied before the app is built so startup warnings are formatted alike.
+    logging.config.dictConfig(log_config)
     try:
         app = create_app(settings)
-    except (PolicyError, UpstreamError, DatabaseNotReadyError) as exc:
+    except (PolicyError, UpstreamError, DatabaseNotReadyError, TracingUnavailableError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    # Uvicorn configures only its own loggers; without this the gateway's
-    # info messages (admin changes, policy reloads) would be dropped.
-    logging.basicConfig(format="%(levelname)s:     %(name)s: %(message)s")
-    logging.getLogger("mcp_warden").setLevel(settings.log_level.upper())
-    uvicorn.run(app, host=settings.host, port=settings.port, log_level=settings.log_level)
+    uvicorn.run(
+        app,
+        host=settings.host,
+        port=settings.port,
+        log_level=settings.log_level,
+        log_config=log_config,
+    )
     return 0
 
 

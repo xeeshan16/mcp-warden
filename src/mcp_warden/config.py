@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from mcp_warden.admin.auth import AdminAuthenticator
 from mcp_warden.jsonrpc.parser import ParseLimits
+from mcp_warden.observability.logs import LogFormat
 from mcp_warden.observability.tracing import TracingMode
 
 
@@ -143,6 +144,9 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = Field(default=8080, ge=1, le=65535)
     log_level: str = "info"
+    log_format: LogFormat = Field(
+        default=LogFormat.TEXT, description="text for terminals, json for log pipelines."
+    )
     metrics_enabled: bool = Field(default=True, description="Serve Prometheus metrics.")
     metrics_token: SecretStr | None = Field(
         default=None,

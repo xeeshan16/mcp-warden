@@ -95,16 +95,24 @@ def test_expiry_must_be_positive(tmp_path: Path) -> None:
 
 
 def test_serve_shows_the_gateways_own_logs(monkeypatch: pytest.MonkeyPatch) -> None:
-    import logging
+    import logging.config
 
     import uvicorn
 
     ran: list[dict[str, object]] = []
+    configured: list[dict[str, object]] = []
     monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: ran.append(kwargs))
+    # Recorded rather than applied, so the test leaves global logging alone.
+    monkeypatch.setattr(logging.config, "dictConfig", configured.append)
     monkeypatch.setenv("WARDEN_AUTH_MODE", "trusted-header")
     monkeypatch.setenv("WARDEN_LOG_LEVEL", "info")
-    logger = logging.getLogger("mcp_warden")
-    monkeypatch.setattr(logger, "level", logger.level)
     assert main(["serve", "--policy", str(EXAMPLE)]) == 0
-    assert ran == [{"host": "127.0.0.1", "port": 8080, "log_level": "info"}]
-    assert logger.getEffectiveLevel() == logging.INFO
+    assert len(ran) == 1
+    kwargs = ran[0]
+    assert (kwargs["host"], kwargs["port"], kwargs["log_level"]) == ("127.0.0.1", 8080, "info")
+    # Uvicorn gets the same configuration that was applied before it started,
+    # and it routes the gateway's own logger, not only uvicorn's.
+    assert configured == [kwargs["log_config"]]
+    loggers = configured[0]["loggers"]
+    assert isinstance(loggers, dict)
+    assert loggers["mcp_warden"]["level"] == "INFO"
