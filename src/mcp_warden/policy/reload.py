@@ -187,6 +187,24 @@ class PolicyReloader:
     def sha256(self) -> str | None:
         return self._state.sha256
 
+    @property
+    def reloads(self) -> int:
+        """Reloads that swapped in a new policy."""
+        return self._state.reloads
+
+    @property
+    def failed_reloads(self) -> int:
+        return self._state.failures
+
+    @property
+    def last_error(self) -> str | None:
+        """Why the latest reload attempt failed; ``None`` once one succeeds."""
+        return self._state.last_error
+
+    @property
+    def loaded_at(self) -> datetime | None:
+        return self._state.loaded_at
+
     def reload(self) -> ReloadResult:
         """Read, validate and apply the file.
 

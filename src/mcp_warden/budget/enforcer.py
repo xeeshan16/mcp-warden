@@ -38,6 +38,14 @@ class UsageStore(Protocol):
     async def settle(self, charges: Sequence[Charge], tokens: int) -> None: ...
 
 
+class BudgetObserver(Protocol):
+    """Told what the enforcer booked and refused; used for metrics."""
+
+    def booked(self, charges: Sequence[Charge], calls: int, tokens: int) -> None: ...
+
+    def refused(self, refusal: Refusal) -> None: ...
+
+
 class BudgetExhaustedError(RetryAfterError):
     """``BUDGET_EXHAUSTED``; ``retry_after`` is the time until the window resets."""
 
@@ -68,11 +76,13 @@ class BudgetEnforcer:
         store: UsageStore,
         estimator: TokenEstimator,
         clock: Callable[[], datetime] | None = None,
+        observer: BudgetObserver | None = None,
     ) -> None:
         self.engine = engine
         self.store = store
         self.estimator = estimator
         self._clock = clock or _utcnow
+        self.observer = observer
 
     def charges_for(self, agent: str, server: str, tool: str, now: datetime) -> list[Charge]:
         charges = []
@@ -113,7 +123,9 @@ class BudgetEnforcer:
         tokens = self.request_tokens(tool, arguments)
         refusal = await self.store.reserve(charges, tokens)
         if refusal is not None:
+            self._notify("refused", refusal)
             raise self._exhausted(refusal, server, tool, now)
+        self._notify("booked", charges, 1, tokens)
         return Reservation(tuple(charges), tokens)
 
     async def settle(
@@ -121,9 +133,20 @@ class BudgetEnforcer:
     ) -> None:
         """Add the reply's tokens. Never fails the call: the tool has already run."""
         try:
-            await self.store.settle(reservation.charges, self.reply_tokens(response))
+            tokens = self.reply_tokens(response)
+            await self.store.settle(reservation.charges, tokens)
         except Exception:
             logger.exception("could not record reply tokens for a budgeted call")
+            return
+        self._notify("booked", reservation.charges, 0, tokens)
+
+    def _notify(self, event: str, *args: Any) -> None:
+        if self.observer is None:
+            return
+        try:
+            getattr(self.observer, event)(*args)
+        except Exception:
+            logger.exception("budget observer failed")
 
     def _exhausted(
         self, refusal: Refusal, server: str, tool: str, now: datetime

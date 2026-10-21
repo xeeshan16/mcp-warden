@@ -1,9 +1,16 @@
 """Turning the proxy's view of a request into audit events, and storing them.
 
+Events are built for every request whether or not an audit store is
+configured, because they are also what metrics are derived from: observers
+(see :mod:`mcp_warden.observability`) see each batch of events, and the store,
+when there is one, persists it. Without a store, argument digests are not
+computed since nothing would keep them.
+
 The recorder is deliberately fail-open: a call that the gateway has already
 answered is not turned into an error because the audit write failed. Failed
-writes are logged and counted (``failed_writes``) so that monitoring can
-alert on them; the metrics endpoint exposes the counter on day 11.
+writes are logged and counted (``failed_writes``, exported as
+``mcp_warden_audit_write_failures_total``) so that monitoring can alert on
+them. A failing observer is logged and never affects the call either.
 
 Events of one HTTP request (one message, or every entry of a batch) are
 written in a single transaction.
@@ -61,27 +68,34 @@ class Trace:
             self.effect = effect
 
 
+EventObserver = Callable[[Sequence[AuditEvent]], None]
+
+
 class AuditRecorder:
     def __init__(
         self,
-        store: AuditStore,
+        store: AuditStore | None,
         hasher: ArgumentHasher | None = None,
         *,
         clock: Callable[[], datetime] | None = None,
         timer: Callable[[], float] = time.perf_counter,
+        observers: Sequence[EventObserver] = (),
     ) -> None:
         self.store = store
         self.hasher = hasher or ArgumentHasher()
         self._clock = clock or _utcnow
         self._timer = timer
+        self._observers = list(observers)
         self.failed_writes = 0
+        self.written_events = 0
 
     def start(self, agent: str, server: str, method: str) -> Trace:
         return Trace(agent, server, method, self._clock(), self._timer())
 
     def note_arguments(self, trace: Trace, tool: str, arguments: dict[str, Any]) -> None:
         trace.tool = tool
-        trace.arguments_digest, trace.arguments_size = self.hasher.digest(arguments)
+        if self.store is not None:
+            trace.arguments_digest, trace.arguments_size = self.hasher.digest(arguments)
 
     def answered(
         self, trace: Trace, response: JsonRpcSuccess | JsonRpcErrorResponse | None
@@ -108,11 +122,21 @@ class AuditRecorder:
     async def write(self, events: Sequence[AuditEvent]) -> None:
         if not events:
             return
+        batch = list(events)
+        for observer in self._observers:
+            try:
+                observer(batch)
+            except Exception:
+                logger.exception("request event observer failed")
+        if self.store is None:
+            return
         try:
-            await anyio.to_thread.run_sync(self.store.append, list(events))
+            await anyio.to_thread.run_sync(self.store.append, batch)
         except Exception:
             self.failed_writes += 1
-            logger.exception("failed to write %d audit event(s)", len(events))
+            logger.exception("failed to write %d audit event(s)", len(batch))
+        else:
+            self.written_events += len(batch)
 
     def _event(
         self, trace: Trace, outcome: Outcome, error_code: int | None, tool_error: bool | None

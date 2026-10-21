@@ -22,6 +22,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Protocol
 
 import httpx
@@ -83,8 +84,35 @@ def same_id(a: RequestId | None, b: RequestId | None) -> bool:
     return type(a) is type(b) and a == b
 
 
-def _upstream_error(upstream: Upstream, message: str, **data: Any) -> JsonRpcError:
-    return JsonRpcError(ErrorCode.UPSTREAM_ERROR, message, {"server": upstream.name, **data})
+class UpstreamFailureKind(StrEnum):
+    """Why the upstream leg failed; a bounded label for metrics and traces."""
+
+    UNREACHABLE = "unreachable"
+    TIMEOUT = "timeout"
+    HTTP_STATUS = "http_status"
+    INVALID_RESPONSE = "invalid_response"
+    TOO_LARGE = "too_large"
+    REJECTED = "rejected"
+
+
+class UpstreamFailureError(JsonRpcError):
+    """A JSON-RPC error raised by the upstream leg, carrying why it failed.
+
+    ``kind`` is for the gateway's own telemetry; it is not part of the error
+    the agent sees, so it can be refined without changing the wire format.
+    """
+
+    def __init__(self, code: ErrorCode, message: str, data: Any, kind: UpstreamFailureKind) -> None:
+        super().__init__(code, message, data)
+        self.kind = kind
+
+
+def _upstream_error(
+    upstream: Upstream, message: str, kind: UpstreamFailureKind, **data: Any
+) -> UpstreamFailureError:
+    return UpstreamFailureError(
+        ErrorCode.UPSTREAM_ERROR, message, {"server": upstream.name, **data}, kind
+    )
 
 
 class HttpUpstreamClient:
@@ -134,13 +162,16 @@ class HttpUpstreamClient:
                 finally:
                     await resp.aclose()
         except (TimeoutError, httpx.TimeoutException) as exc:
-            raise JsonRpcError(
+            raise UpstreamFailureError(
                 ErrorCode.UPSTREAM_TIMEOUT,
                 "upstream timed out",
                 {"server": upstream.name, "timeout_seconds": upstream.timeout_seconds},
+                UpstreamFailureKind.TIMEOUT,
             ) from exc
         except httpx.HTTPError as exc:
-            raise _upstream_error(upstream, "upstream unreachable") from exc
+            raise _upstream_error(
+                upstream, "upstream unreachable", UpstreamFailureKind.UNREACHABLE
+            ) from exc
 
     async def _read(
         self,
@@ -156,7 +187,12 @@ class HttpUpstreamClient:
             # Notifications and responses: the server acknowledges with 202.
             if resp.status_code in (200, 202, 204):
                 return UpstreamReply(resp.status_code, None, session_id)
-            raise _upstream_error(upstream, "upstream rejected message", status=resp.status_code)
+            raise _upstream_error(
+                upstream,
+                "upstream rejected message",
+                UpstreamFailureKind.REJECTED,
+                status=resp.status_code,
+            )
 
         content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
         if content_type == "text/event-stream" and resp.status_code == 200:
@@ -168,16 +204,25 @@ class HttpUpstreamClient:
             except JsonRpcError:
                 if resp.status_code >= 400:
                     raise _upstream_error(
-                        upstream, "upstream returned an HTTP error", status=resp.status_code
+                        upstream,
+                        "upstream returned an HTTP error",
+                        UpstreamFailureKind.HTTP_STATUS,
+                        status=resp.status_code,
                     ) from None
                 raise
             return UpstreamReply(resp.status_code, reply, session_id)
         if resp.status_code >= 400:
             raise _upstream_error(
-                upstream, "upstream returned an HTTP error", status=resp.status_code
+                upstream,
+                "upstream returned an HTTP error",
+                UpstreamFailureKind.HTTP_STATUS,
+                status=resp.status_code,
             )
         raise _upstream_error(
-            upstream, "upstream returned an unsupported content type", content_type=content_type
+            upstream,
+            "upstream returned an unsupported content type",
+            UpstreamFailureKind.INVALID_RESPONSE,
+            content_type=content_type,
         )
 
     async def _read_capped(self, upstream: Upstream, chunks: AsyncIterator[bytes]) -> bytes:
@@ -186,7 +231,10 @@ class HttpUpstreamClient:
             buf.extend(chunk)
             if len(buf) > self._limits.max_bytes:
                 raise _upstream_error(
-                    upstream, "upstream response too large", max_bytes=self._limits.max_bytes
+                    upstream,
+                    "upstream response too large",
+                    UpstreamFailureKind.TOO_LARGE,
+                    max_bytes=self._limits.max_bytes,
                 )
         return bytes(buf)
 
@@ -205,7 +253,12 @@ class HttpUpstreamClient:
             async for line in resp.aiter_lines():
                 total += len(line) + 1
                 if total > limit:
-                    raise _upstream_error(upstream, "upstream response too large", max_bytes=limit)
+                    raise _upstream_error(
+                        upstream,
+                        "upstream response too large",
+                        UpstreamFailureKind.TOO_LARGE,
+                        max_bytes=limit,
+                    )
                 yield line
 
         dropped = 0
@@ -221,7 +274,11 @@ class HttpUpstreamClient:
                 reply = self._to_response(upstream, value, response_id)
                 return UpstreamReply(resp.status_code, reply, session_id, dropped)
             dropped += 1
-        raise _upstream_error(upstream, "upstream closed the stream without a response")
+        raise _upstream_error(
+            upstream,
+            "upstream closed the stream without a response",
+            UpstreamFailureKind.INVALID_RESPONSE,
+        )
 
     def _decode(self, upstream: Upstream, raw: bytes | str) -> Any:
         # Re-label parse failures: a PARSE_ERROR would tell the agent that *its*
@@ -230,7 +287,10 @@ class HttpUpstreamClient:
             return decode_json(raw, self._limits)
         except JsonRpcError as exc:
             raise _upstream_error(
-                upstream, "upstream sent invalid JSON", reason=exc.message
+                upstream,
+                "upstream sent invalid JSON",
+                UpstreamFailureKind.INVALID_RESPONSE,
+                reason=exc.message,
             ) from exc
 
     @staticmethod
@@ -239,7 +299,15 @@ class HttpUpstreamClient:
         if isinstance(parsed, InvalidMessage) or not isinstance(
             parsed, JsonRpcSuccess | JsonRpcErrorResponse
         ):
-            raise _upstream_error(upstream, "upstream sent an invalid JSON-RPC response")
+            raise _upstream_error(
+                upstream,
+                "upstream sent an invalid JSON-RPC response",
+                UpstreamFailureKind.INVALID_RESPONSE,
+            )
         if not same_id(parsed.id, response_id):
-            raise _upstream_error(upstream, "upstream response id does not match the request")
+            raise _upstream_error(
+                upstream,
+                "upstream response id does not match the request",
+                UpstreamFailureKind.INVALID_RESPONSE,
+            )
         return parsed

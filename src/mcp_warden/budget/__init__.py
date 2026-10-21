@@ -4,6 +4,7 @@ from mcp_warden.budget.database import DatabaseUsageStore
 from mcp_warden.budget.enforcer import (
     BudgetEnforcer,
     BudgetExhaustedError,
+    BudgetObserver,
     Reservation,
     UsageStore,
 )
@@ -15,6 +16,7 @@ from mcp_warden.budget.window import window_bounds
 __all__ = [
     "BudgetEnforcer",
     "BudgetExhaustedError",
+    "BudgetObserver",
     "CharRatioEstimator",
     "Charge",
     "DatabaseUsageStore",
