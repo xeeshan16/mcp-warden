@@ -259,7 +259,10 @@ def test_query_api_filters_and_pages(clock: FakeClock) -> None:
 def test_audit_off_disables_recording_and_the_api(clock: FakeClock) -> None:
     with gateway(clock, None, audit_store=AuditStoreKind.OFF) as client:
         call(client, session(client), "add", a=1, b=2)
-        assert client.app.state.audit is None  # type: ignore[attr-defined]
+        # Events are still built for metrics, but nothing stores them.
+        recorder = client.app.state.audit  # type: ignore[attr-defined]
+        assert recorder.store is None
+        assert recorder.written_events == 0
         assert client.get("/v1/audit", headers=ADMIN).status_code == 404
 
 

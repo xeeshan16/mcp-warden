@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from mcp_warden.admin.auth import AdminAuthenticator
 from mcp_warden.jsonrpc.parser import ParseLimits
+from mcp_warden.observability.tracing import TracingMode
 
 
 class AuthMode(StrEnum):
@@ -142,6 +143,27 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = Field(default=8080, ge=1, le=65535)
     log_level: str = "info"
+    metrics_enabled: bool = Field(default=True, description="Serve Prometheus metrics.")
+    metrics_token: SecretStr | None = Field(
+        default=None,
+        description="Bearer token required on GET /metrics; unset leaves it open to scrapers.",
+    )
+    metrics_max_label_values: int = Field(
+        default=1000,
+        ge=1,
+        description="Distinct agents, tools and rules per metric label before __other__.",
+    )
+    tracing: TracingMode = Field(
+        default=TracingMode.OFF, description="off, console or otlp (needs the otel extra)."
+    )
+    otlp_endpoint: str | None = Field(
+        default=None,
+        description="OTLP/HTTP traces URL, e.g. http://collector:4318/v1/traces.",
+    )
+    service_name: str = Field(default="mcp-warden", description="service.name of the spans.")
+    trace_sample_ratio: float = Field(
+        default=1.0, ge=0, le=1, description="Share of new traces sampled (parent-based)."
+    )
 
     max_message_bytes: int = Field(
         default=1_000_000, ge=1, description="Largest JSON-RPC payload accepted, in bytes."
@@ -174,6 +196,13 @@ class Settings(BaseSettings):
             {name: token.get_secret_value() for name, token in self.admin_tokens.items()},
             shared,
         )
+
+    @field_validator("metrics_token")
+    @classmethod
+    def _strong_metrics_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and len(value.get_secret_value()) < 16:
+            raise ValueError("WARDEN_METRICS_TOKEN must be at least 16 characters")
+        return value
 
     @field_validator("audit_hash_key")
     @classmethod

@@ -9,13 +9,15 @@ from typing import Any
 
 import httpx
 from fastapi.testclient import TestClient
+from opentelemetry.trace import TracerProvider
 
 from mcp_warden.app import create_app
 from mcp_warden.budget import UsageStore
 from mcp_warden.config import AuthMode, Settings
 from mcp_warden.fake_upstream import create_fake_upstream
+from mcp_warden.observability.metrics import GatewayMetrics
 from mcp_warden.policy import Effect, Policy, PolicyEngine
-from mcp_warden.proxy import HttpUpstreamClient
+from mcp_warden.proxy import HttpUpstreamClient, UpstreamTransport
 from mcp_warden.ratelimit import BucketStore
 from mcp_warden.upstreams import Upstream, UpstreamRegistry
 
@@ -47,12 +49,17 @@ def make_client(
     bucket_store: BucketStore | None = None,
     usage_ledger: UsageStore | None = None,
     budget_clock: Callable[[], datetime] | None = None,
+    metrics: GatewayMetrics | None = None,
+    tracer_provider: TracerProvider | None = None,
+    transport: UpstreamTransport | None = None,
     **settings: Any,
 ) -> TestClient:
     """Gateway in front of the fake upstream; the policy allows everything
     unless a test passes its own engine (policy behaviour has its own tests)."""
     fake = create_fake_upstream(sse=sse)
-    transport = HttpUpstreamClient(httpx.AsyncClient(transport=httpx.ASGITransport(app=fake)))
+    transport = transport or HttpUpstreamClient(
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=fake))
+    )
     registry = UpstreamRegistry([Upstream("demo", "http://upstream.test/mcp", timeout, 1.0, {})])
     app = create_app(
         Settings(
@@ -67,6 +74,8 @@ def make_client(
         bucket_store=bucket_store,
         usage_store=usage_ledger,
         budget_clock=budget_clock,
+        metrics=metrics,
+        tracer_provider=tracer_provider,
     )
     return TestClient(app)
 

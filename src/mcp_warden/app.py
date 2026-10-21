@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import logging
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -12,7 +15,9 @@ from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse, Response
+from opentelemetry.trace import TracerProvider
 from pydantic import BaseModel, Field
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mcp_warden import __version__
 from mcp_warden.admin import AdminPrincipal
@@ -63,9 +68,16 @@ from mcp_warden.identity import (
     TrustedHeaderAuthenticator,
 )
 from mcp_warden.jsonrpc import ErrorCode, error_response, to_wire
+from mcp_warden.observability.metrics import CONTENT_TYPE, GatewayMetrics
+from mcp_warden.observability.tracing import (
+    build_tracer_provider,
+    shutdown_provider,
+    tracer_from,
+)
 from mcp_warden.policy import PolicyEngine, PolicyError, PolicyReloader, ToolCallRequest
 from mcp_warden.proxy import (
     HttpUpstreamClient,
+    InstrumentedTransport,
     PolicyGuard,
     ProxyResult,
     ProxyService,
@@ -217,6 +229,50 @@ def _jsonrpc_http_error(status: int, code: ErrorCode, message: str) -> Response:
     return JSONResponse(to_wire(error_response(None, code, message)), status_code=status)
 
 
+class _HttpMetricsMiddleware:
+    """Counts every HTTP request by route template (bounded), method and status."""
+
+    def __init__(self, app: ASGIApp, metrics: GatewayMetrics) -> None:
+        self.app = app
+        self.metrics = metrics
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = time.perf_counter()
+        status = 500
+
+        async def send_wrapper(message: Message) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            route = scope.get("route")
+            # The template, never the raw path, so ids in paths do not become labels.
+            template = getattr(route, "path", None) or "unmatched"
+            self.metrics.observe_http(
+                template, scope["method"], status, time.perf_counter() - started
+            )
+
+
+def _metrics_authorized(request: Request, token: str | None) -> bool:
+    if token is None:
+        return True
+    header = request.headers.get("authorization", "")
+    scheme, _, supplied = header.partition(" ")
+    if scheme.lower() != "bearer" or not supplied:
+        return False
+    return hmac.compare_digest(
+        hashlib.sha256(supplied.strip().encode()).digest(),
+        hashlib.sha256(token.encode()).digest(),
+    )
+
+
 def create_app(
     settings: Settings | None = None,
     engine: PolicyEngine | None = None,
@@ -231,6 +287,8 @@ def create_app(
     approval_gate: ApprovalGate | None = None,
     audit_store: AuditStore | None = None,
     audit_clock: Callable[[], datetime] | None = None,
+    metrics: GatewayMetrics | None = None,
+    tracer_provider: TracerProvider | None = None,
 ) -> FastAPI:
     """Build the FastAPI app.
 
@@ -238,8 +296,22 @@ def create_app(
     schema are checked eagerly so that a broken file, a missing upstream
     credential or a forgotten migration stops startup instead of surfacing on
     the first request.
+
+    ``tracer_provider`` overrides ``WARDEN_TRACING``; a provider passed in is
+    the caller's to shut down.
     """
     settings = settings or Settings()
+    if metrics is None and settings.metrics_enabled:
+        metrics = GatewayMetrics(max_label_values=settings.metrics_max_label_values)
+    owned_provider = None
+    if tracer_provider is None:
+        tracer_provider = owned_provider = build_tracer_provider(
+            settings.tracing,
+            service_name=settings.service_name,
+            otlp_endpoint=settings.otlp_endpoint,
+            sample_ratio=settings.trace_sample_ratio,
+        )
+    tracer = tracer_from(tracer_provider)
     if engine is None:
         reloader = PolicyReloader.from_file(settings.policy_path)
         engine = reloader.engine
@@ -251,9 +323,14 @@ def create_app(
             if settings.upstreams_path is not None
             else UpstreamRegistry()
         )
-    transport = transport or HttpUpstreamClient(
-        max_response_bytes=settings.max_upstream_response_bytes,
-        max_json_depth=settings.max_json_depth,
+    transport = InstrumentedTransport(
+        transport
+        or HttpUpstreamClient(
+            max_response_bytes=settings.max_upstream_response_bytes,
+            max_json_depth=settings.max_json_depth,
+        ),
+        metrics=metrics,
+        tracer=tracer,
     )
     db_engine = None
     if (
@@ -316,19 +393,19 @@ def create_app(
             audit_store = DatabaseAuditStore(make_sessionmaker(db_engine))
         elif settings.audit_store is AuditStoreKind.MEMORY:
             audit_store = InMemoryAuditStore(settings.audit_memory_max_events)
-    recorder = None
-    if audit_store is not None:
-        key = settings.audit_hash_key
-        recorder = AuditRecorder(
-            audit_store,
-            ArgumentHasher(key.get_secret_value().encode() if key is not None else None),
-            clock=audit_clock,
+    key = settings.audit_hash_key
+    # Always built: metrics derive from its events even with the audit log off.
+    recorder = AuditRecorder(
+        audit_store,
+        ArgumentHasher(key.get_secret_value().encode() if key is not None else None),
+        clock=audit_clock,
+        observers=[metrics.observe_events] if metrics is not None else (),
+    )
+    if audit_store is not None and key is None:
+        logger.warning(
+            "audit argument digests are plain SHA-256; set WARDEN_AUDIT_HASH_KEY "
+            "so that small arguments cannot be recovered by guessing"
         )
-        if key is None:
-            logger.warning(
-                "audit argument digests are plain SHA-256; set WARDEN_AUDIT_HASH_KEY "
-                "so that small arguments cannot be recovered by guessing"
-            )
     retention = RetentionJob(
         timedelta(days=settings.retention_days),
         audit=audit_store,
@@ -341,6 +418,7 @@ def create_app(
         usage_store,
         token_estimator or CharRatioEstimator(settings.chars_per_token),
         budget_clock,
+        observer=metrics,
     )
     proxy = ProxyService(
         upstreams,
@@ -352,7 +430,11 @@ def create_app(
         budgets,
         approval_gate,
         recorder,
+        tracer=tracer,
+        metrics=metrics,
     )
+    if metrics is not None:
+        metrics.track_state(reloader, recorder)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -377,6 +459,7 @@ def create_app(
             await transport.aclose()
             if db_engine is not None:
                 db_engine.dispose()
+            shutdown_provider(owned_provider)
 
     app = FastAPI(title="MCP Warden", version=__version__, lifespan=lifespan)
     app.state.settings = settings
@@ -390,6 +473,20 @@ def create_app(
     app.state.audit_store = audit_store
     app.state.audit = recorder
     app.state.retention = retention
+    app.state.metrics = metrics
+    app.state.tracer_provider = tracer_provider
+    if metrics is not None:
+        app.add_middleware(_HttpMetricsMiddleware, metrics=metrics)
+        metrics_token = (
+            settings.metrics_token.get_secret_value() if settings.metrics_token else None
+        )
+
+        @app.get("/metrics", tags=["ops"], include_in_schema=False)
+        def prometheus_metrics(request: Request) -> Response:
+            """Prometheus text exposition of the gateway's metrics."""
+            if not _metrics_authorized(request, metrics_token):
+                return Response(status_code=401, headers={"www-authenticate": "Bearer"})
+            return Response(metrics.exposition(), media_type=CONTENT_TYPE)
 
     @app.get("/healthz", tags=["ops"])
     def healthz() -> dict[str, str]:
@@ -543,6 +640,8 @@ def create_app(
         """Streamable HTTP endpoint: forward JSON-RPC to the named upstream."""
         content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
         if content_type != "application/json":
+            if metrics is not None:
+                metrics.rejected("unsupported_media_type")
             return _jsonrpc_http_error(
                 415, ErrorCode.INVALID_REQUEST, "content-type must be application/json"
             )
@@ -550,6 +649,8 @@ def create_app(
         try:
             body = await _read_body(request, limit)
         except _BodyTooLargeError:
+            if metrics is not None:
+                metrics.rejected("payload_too_large")
             return _jsonrpc_http_error(413, ErrorCode.PAYLOAD_TOO_LARGE, "payload too large")
         result = await proxy.handle(server, body, request.headers)
         return _http_response(result)
