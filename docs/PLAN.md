@@ -98,3 +98,13 @@ composes them as a pipeline so a stage can short-circuit with a JSON-RPC error.
   The CLI keeps working directly on the database for agents, keys, approvals, usage and
   audit, and talks to the gateway only for what lives in its memory (the policy in
   force). Day 11 adds a metric for failed reloads and audit writes.
+- 2026-10-21: day 11 done as planned. Metrics are derived from the same request events
+  as the audit log, so the recorder now builds events even with the audit log off and
+  only stores them when a store is configured. Labels fed by agents are bounded
+  (unknown methods become `other`, agents, tools and rules beyond a configurable count
+  `__other__`) because tool names come from agents. Budget usage is exported as
+  counters of what was booked and refused rather than a gauge read from the ledger at
+  scrape time, which would put a database query behind every scrape. Tracing depends on
+  `opentelemetry-api` only; the SDK and OTLP exporter are an `otel` extra and the
+  provider is per gateway, not global. MCP session ids are kept out of spans because they
+  act as capabilities for the upstream session.

@@ -392,3 +392,53 @@ policy kept denying the call, and a revoked key answered with `401`.
 **Next (day 11):** observability: Prometheus metrics (decisions, latency, upstream
 errors, budget usage, audit write failures, policy reloads), OpenTelemetry tracing with
 an optional exporter, and structured JSON logs.
+
+## Day 11 — 2026-10-21: metrics, tracing and structured logs
+
+**Done**
+
+- `mcp_warden.observability.metrics.GatewayMetrics`, one registry per gateway, served
+  at `GET /metrics` (optionally behind `WARDEN_METRICS_TOKEN`, off with
+  `WARDEN_METRICS_ENABLED=false`):
+  - requests and their latency by server, method and outcome; tool calls by agent,
+    server, tool and outcome; policy decisions by effect and deciding rule; tool results
+    with `isError`, all derived from the audit recorder's events;
+  - the upstream leg by result (`ok` or a failure kind) and latency, through a new
+    `InstrumentedTransport` wrapper;
+  - budget calls, tokens and refusals through a `BudgetObserver` hook on the enforcer;
+  - HTTP requests by route template and status (a small ASGI middleware), and requests
+    rejected before any message was handled;
+  - a scrape-time collector for build info, the policy in force, reload counters and
+    the last reload failing, and audit events written and failed writes (the counter
+    promised on day 9).
+- `mcp_warden.observability.labels`: known MCP methods only, and a `LabelGuard` that
+  folds agents, tools and rules past `WARDEN_METRICS_MAX_LABEL_VALUES` into `__other__`
+  and counts the overflow.
+- Upstream errors carry a failure kind (`UpstreamFailureError`) for telemetry; the
+  JSON-RPC error agents receive is unchanged.
+- `AuditRecorder` takes an optional store and observers; with `WARDEN_AUDIT_STORE=off`
+  events still feed metrics and no argument digest is computed.
+- OpenTelemetry: one `SERVER` span per JSON-RPC request (`tools/call <tool>`) with the
+  decision as attributes, child spans for approval, rate limit, budget and the upstream
+  call, W3C `traceparent` extracted from the agent and injected towards the upstream.
+  `WARDEN_TRACING=off|console|otlp`, `WARDEN_OTLP_ENDPOINT`, `WARDEN_SERVICE_NAME`,
+  `WARDEN_TRACE_SAMPLE_RATIO`; SDK and exporter in the new `otel` extra.
+- `WARDEN_LOG_FORMAT=json`: a JSON formatter with trace and span ids, `extra` fields and
+  structured access log lines, applied to the gateway and uvicorn before the app is
+  built.
+
+**Tests:** 699 passing locally on SQLite (33 new) with 51 PostgreSQL variants skipped;
+749 passing with a local PostgreSQL 16, 99% line coverage (100% for the new
+`observability` modules and `proxy/instrumented.py`). ruff, ruff format, strict mypy and
+`uv build` clean. New tests cover the label bounds (50 made-up tool names produce three
+series), every metric family from events, budgets and state, the endpoint's token and
+off switch, one registry per gateway, failure kinds including a lost session, spans and
+their parent links for single calls and batches, propagation in both directions, that
+no argument, session id or upstream credential appears in any span, and the JSON log
+format in a fresh interpreter. Verified by hand with the gateway under uvicorn, an API
+key and the database audit store (output in the README): the agent's trace id continued
+through the gateway, and the denied call produced a span and metrics but no upstream
+request.
+
+**Next (day 12):** packaging and demo: Dockerfile, Docker Compose with PostgreSQL, the
+gateway and the demo MCP server, and a scripted end-to-end demo with a fake agent.

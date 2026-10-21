@@ -6,7 +6,7 @@
 **A self-hosted policy, budget and audit gateway for AI agent tool calls over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).**
 
-> Status: under active development (day 10 of a 14-day build). See
+> Status: under active development (day 11 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md)
 > for the daily log. Features marked _planned_ are not implemented yet.
 
@@ -56,7 +56,9 @@ with a policy file you can review in a pull request.
 | Admin API for agents, keys and budget usage (`/v1/agents`, `/v1/keys`, `/v1/usage`) | ✅ day 10 |
 | Named admin tokens; approval decisions recorded under the authenticated admin | ✅ day 10 |
 | Validated policy hot reload (`POST /v1/policy/reload`, `mcp-warden policy reload`, file watch) | ✅ day 10 |
-| Prometheus metrics and OpenTelemetry tracing | _planned_ |
+| Prometheus metrics (`GET /metrics`) with bounded labels, optional bearer token | ✅ day 11 |
+| OpenTelemetry tracing: a span per request, W3C context from agent to upstream, OTLP export | ✅ day 11 |
+| Structured JSON logs with trace and span ids (`WARDEN_LOG_FORMAT=json`) | ✅ day 11 |
 | PostgreSQL persistence, Docker Compose demo | _planned_ |
 
 ## Architecture
@@ -80,8 +82,9 @@ flowchart LR
 So far the policy engine (day 1), the JSON-RPC / MCP message layer (day 2), the proxy
 path to upstream servers (day 3), policy enforcement inside the proxy (day 4), agent
 authentication with API keys (day 5), rate limits (day 6), budgets (day 7), human
-approval (day 8) and the audit log with its retention job (day 9) are in place. The full
-admin API lands next (see the plan).
+approval (day 8), the audit log with its retention job (day 9), the admin API with
+policy hot reload (day 10) and observability (day 11) are in place. Packaging and the
+Docker Compose demo land next (see the plan).
 
 ### Policy resolution
 
@@ -534,6 +537,123 @@ approval, so the policy file can be reloaded into a running gateway:
   so an edited limit keeps its consumption and a removed one stops counting; a parked
   approval only matters if the new policy still requires approval for the call.
 
+### Observability
+
+The gateway reports what it decides through three channels, all built so that tool
+arguments, results, error messages and MCP session ids never leave it.
+
+**Metrics.** `GET /metrics` serves Prometheus text format. Most series are derived from
+the same per-request events the audit log is built from, so a dashboard and the audit
+trail cannot disagree, and they keep working with `WARDEN_AUDIT_STORE=off`.
+
+| Metric | Labels | What it shows |
+| --- | --- | --- |
+| `mcp_warden_requests_total`, `mcp_warden_request_duration_seconds` | server, method, outcome | Every JSON-RPC request and how long the gateway took to answer it |
+| `mcp_warden_tool_calls_total` | agent, server, tool, outcome | `tools/call` by result: forwarded, denied, approval_pending, rate_limited, budget_exhausted, upstream_error, ... |
+| `mcp_warden_policy_decisions_total` | agent, server, effect, rule | Which rule decided (`default` when none matched) |
+| `mcp_warden_tool_errors_total` | server, tool | Forwarded calls whose result had `isError` |
+| `mcp_warden_upstream_requests_total`, `mcp_warden_upstream_duration_seconds` | server, result | The upstream leg: `ok` or the failure kind (`unreachable`, `timeout`, `http_status`, `invalid_response`, `too_large`, `session_lost`) |
+| `mcp_warden_budget_calls_total`, `mcp_warden_budget_tokens_total`, `mcp_warden_budget_refusals_total` | budget, agent (, exhausted) | What was booked against each budget and what it refused |
+| `mcp_warden_http_rejections_total` | reason | Requests refused before any message was handled (unauthenticated, unknown server, oversized, ...) |
+| `mcp_warden_http_requests_total`, `mcp_warden_http_request_duration_seconds` | route, method, status | Every HTTP route, admin API included, by route template |
+| `mcp_warden_policy_info`, `_rules`, `_reloads_total`, `_reload_failures_total`, `_reload_error`, `_loaded_timestamp_seconds` | | The policy in force and its reloads; `reload_error` is 1 while a broken edit is being refused |
+| `mcp_warden_audit_events_written_total`, `mcp_warden_audit_write_failures_total` | | The audit log is fail-open, so alert on failures |
+| `mcp_warden_metric_label_overflow_total` | label | Label values folded into `__other__` |
+
+Every series lives in a registry owned by one gateway, never the process-global one.
+Labels fed by agents are bounded, because an agent calling a million made-up tool names
+must not create a million time series: methods that are not MCP methods are reported as
+`other`, and agents, tools and rules beyond `WARDEN_METRICS_MAX_LABEL_VALUES` distinct
+values (1000 by default) as `__other__`, counted in the overflow metric. HTTP routes are
+labelled by template (`/mcp/{server}`), never by raw path. State that already lives
+somewhere (the policy in force, reload and audit counters) is read at scrape time rather
+than copied into gauges that could drift. Set `WARDEN_METRICS_TOKEN` to require
+`Authorization: Bearer <token>` on `/metrics`, or `WARDEN_METRICS_ENABLED=false` to
+turn metrics off.
+
+**Traces.** With `pip install 'mcp-warden[otel]'` and `WARDEN_TRACING=otlp` (or
+`console` to try it), each JSON-RPC request becomes a `SERVER` span named
+`tools/call <tool>` (or the method), with the decision as attributes: `mcp.method.name`,
+`gen_ai.tool.name`, `mcp.protocol.version`, `mcp_warden.agent`, `mcp_warden.outcome`,
+`mcp_warden.policy.effect`, `mcp_warden.policy.rule_id`, `mcp_warden.approval.id` and the
+JSON-RPC error code. Child spans cover the stages that can wait (`mcp_warden.approval`,
+`mcp_warden.rate_limit`, `mcp_warden.budget`) and the upstream leg (`POST <server>`,
+`CLIENT`), which records only the upstream's host and port, never its URL, since URLs
+can carry credentials.
+
+Context propagation is W3C Trace Context in both directions: a `traceparent` sent by the
+agent becomes the parent of the gateway's spans, and the upstream receives the gateway's
+own `traceparent`, so one trace covers agent, gateway and MCP server. Refusals are
+annotated, not marked as errors, since a denied call is the gateway doing its job; an
+upstream failure marks both spans as errors. The gateway's code depends only on
+`opentelemetry-api`, so without the extra (or with `WARDEN_TRACING=off`, the default)
+every span is a no-op. The provider is built per gateway rather than installed globally;
+`WARDEN_OTLP_ENDPOINT` (an OTLP/HTTP traces URL), `WARDEN_SERVICE_NAME` and
+`WARDEN_TRACE_SAMPLE_RATIO` (parent-based) configure it, and the SDK's own
+`OTEL_EXPORTER_OTLP_*` variables work too.
+
+**Logs.** `WARDEN_LOG_FORMAT=json` writes one JSON object per line for the gateway and
+uvicorn. A line logged inside a span carries `trace_id` and `span_id`, fields passed with
+`extra=` are kept, and access log lines are split into `client`, `method`, `path` and
+`status`. The default `text` format is for terminals.
+
+From a local run (fake upstream on port 9001, an API key for `support-bot`, the audit log
+in SQLite, `WARDEN_LOG_FORMAT=json WARDEN_TRACING=console`): an initialize, an allowed
+`add` sent with a `traceparent`, and a `delete_records` call the policy denies. The
+gateway's first log lines:
+
+```json
+{"ts": "2026-10-21T10:08:10.502Z", "level": "warning", "logger": "mcp_warden.app", "message": "audit argument digests are plain SHA-256; set WARDEN_AUDIT_HASH_KEY so that small arguments cannot be recovered by guessing"}
+{"ts": "2026-10-21T10:08:10.522Z", "level": "info", "logger": "uvicorn.error", "message": "Started server process [3596]"}
+```
+
+The span for the allowed call continues the agent's trace (`4bf92f...`, parent
+`00f067...`), trimmed to the interesting fields:
+
+```json
+{
+    "name": "tools/call add",
+    "context": {"trace_id": "0x4bf92f3577b34da6a3ce929d0e0e4736", "span_id": "0x11713a5088acb65e"},
+    "kind": "SpanKind.SERVER",
+    "parent_id": "0x00f067aa0ba902b7",
+    "status": {"status_code": "UNSET"},
+    "attributes": {
+        "mcp.method.name": "tools/call",
+        "mcp_warden.agent": "support-bot",
+        "mcp_warden.server": "demo",
+        "mcp.protocol.version": "2025-11-25",
+        "mcp_warden.outcome": "forwarded",
+        "gen_ai.tool.name": "add",
+        "gen_ai.operation.name": "execute_tool",
+        "mcp_warden.policy.effect": "allow",
+        "mcp_warden.policy.rule_id": "demo-basics",
+        "mcp_warden.tool.is_error": false
+    }
+}
+```
+
+And `curl -s localhost:8080/metrics`, filtered to a few series:
+
+```text
+mcp_warden_requests_total{method="initialize",outcome="forwarded",server="demo"} 1.0
+mcp_warden_requests_total{method="tools/call",outcome="forwarded",server="demo"} 1.0
+mcp_warden_requests_total{method="tools/call",outcome="denied",server="demo"} 1.0
+mcp_warden_tool_calls_total{agent="support-bot",outcome="forwarded",server="demo",tool="add"} 1.0
+mcp_warden_tool_calls_total{agent="support-bot",outcome="denied",server="demo",tool="delete_records"} 1.0
+mcp_warden_policy_decisions_total{agent="support-bot",effect="allow",rule="demo-basics",server="demo"} 1.0
+mcp_warden_policy_decisions_total{agent="support-bot",effect="deny",rule="never-destructive",server="demo"} 1.0
+mcp_warden_upstream_requests_total{result="ok",server="demo"} 2.0
+mcp_warden_upstream_duration_seconds_count{server="demo"} 2.0
+mcp_warden_build_info{version="0.1.0"} 1.0
+mcp_warden_policy_info{sha256="aac81c906083",version="1"} 1.0
+mcp_warden_policy_rules 9.0
+mcp_warden_policy_reload_error 0.0
+mcp_warden_audit_events_written_total 3.0
+```
+
+The denied call has a span and a metric but no upstream request: it never left the
+gateway.
+
 ## Quick start
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
@@ -897,7 +1017,11 @@ Configuration is read from `WARDEN_*` environment variables (`WARDEN_POLICY_PATH
 admin tokens `WARDEN_ADMIN_TOKENS` (named, as JSON) and `WARDEN_ADMIN_TOKEN` (shared),
 `WARDEN_POLICY_RELOAD_INTERVAL_SECONDS`, the audit settings `WARDEN_AUDIT_STORE` (`memory`, `database` or
 `off`), `WARDEN_AUDIT_HASH_KEY` and `WARDEN_AUDIT_MEMORY_MAX_EVENTS`, the retention
-settings `WARDEN_RETENTION_DAYS` and `WARDEN_RETENTION_INTERVAL_SECONDS`, `WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`, the parser
+settings `WARDEN_RETENTION_DAYS` and `WARDEN_RETENTION_INTERVAL_SECONDS`, `WARDEN_HOST`, `WARDEN_PORT`, `WARDEN_LOG_LEVEL`,
+`WARDEN_LOG_FORMAT` (`text` or `json`), the metrics settings `WARDEN_METRICS_ENABLED`,
+`WARDEN_METRICS_TOKEN` and `WARDEN_METRICS_MAX_LABEL_VALUES`, the tracing settings
+`WARDEN_TRACING` (`off`, `console` or `otlp`), `WARDEN_OTLP_ENDPOINT`,
+`WARDEN_SERVICE_NAME` and `WARDEN_TRACE_SAMPLE_RATIO`, the parser
 limits `WARDEN_MAX_MESSAGE_BYTES`, `WARDEN_MAX_JSON_DEPTH`, `WARDEN_MAX_BATCH_SIZE`, and
 `WARDEN_MAX_UPSTREAM_RESPONSE_BYTES`).
 
