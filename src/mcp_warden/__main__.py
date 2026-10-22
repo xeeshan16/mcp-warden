@@ -5,7 +5,7 @@
 ``db``, ``agents`` and ``keys`` manage the identity database; ``usage``
 reports the budget usage ledger; ``approvals`` lists and decides tool calls
 waiting for a human; ``audit`` queries the audit log and ``retention`` prunes
-old history.
+old history; ``demo`` runs a scripted agent against a running gateway.
 """
 
 from __future__ import annotations
@@ -183,6 +183,32 @@ def _cmd_fake_upstream(args: argparse.Namespace) -> int:
     app = create_fake_upstream(sse=args.sse)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
+
+
+def _cmd_demo(args: argparse.Namespace) -> int:
+    from mcp_warden.demo import Demo, DemoError
+
+    token = os.environ.get("WARDEN_ADMIN_TOKEN")
+    if not token:
+        print("error: set WARDEN_ADMIN_TOKEN to an admin token", file=sys.stderr)
+        return 2
+    base_url = args.gateway or os.environ.get("WARDEN_GATEWAY_URL") or DEFAULT_GATEWAY
+    with httpx.Client(base_url=base_url, timeout=30.0) as client:
+        demo = Demo(
+            client,
+            token,
+            server=args.server,
+            agent=args.agent,
+            metrics_token=os.environ.get("WARDEN_METRICS_TOKEN") or None,
+        )
+        try:
+            demo.wait_until_ready(args.wait)
+        except DemoError as exc:
+            print(f"error: {base_url}: {exc}", file=sys.stderr)
+            return 1
+        print(f"MCP Warden demo against {base_url} (server {args.server!r}, run {demo.run_id})")
+        report = demo.run()
+    return 0 if report.ok else 1
 
 
 def _database_url(args: argparse.Namespace) -> str:
@@ -651,6 +677,19 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument("--json", action="store_true", help="print the response as JSON")
         p.set_defaults(func=_cmd_policy)
+
+    demo = sub.add_parser(
+        "demo", help="walk a scripted agent through a running gateway (needs an admin token)"
+    )
+    demo.add_argument(
+        "--gateway", help=f"gateway URL (default: WARDEN_GATEWAY_URL or {DEFAULT_GATEWAY})"
+    )
+    demo.add_argument("--server", default="demo", help="upstream running the fake MCP server")
+    demo.add_argument("--agent", default="support-bot", help="agent to onboard and act as")
+    demo.add_argument(
+        "--wait", type=float, default=60.0, help="seconds to wait for the gateway to be ready"
+    )
+    demo.set_defaults(func=_cmd_demo)
 
     _add_identity_commands(sub)
     return parser
