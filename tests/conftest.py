@@ -7,8 +7,15 @@ from pathlib import Path
 import pytest
 from sqlalchemy import Engine
 
+from mcp_warden.config import Settings
 from mcp_warden.db import make_engine, make_sessionmaker, upgrade
 from mcp_warden.identity import IdentityStore
+
+
+@pytest.fixture(autouse=True)
+def _ignore_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep a developer's .env (Docker Compose reads one) out of the tests."""
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
 
 
 @pytest.fixture

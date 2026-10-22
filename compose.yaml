@@ -1,0 +1,110 @@
+# MCP Warden with PostgreSQL and the fake MCP server, for trying it out locally.
+#
+#   cp .env.example .env            # then fill in random values
+#   docker compose up --build -d
+#   docker compose --profile demo run --rm demo
+#
+# or simply: scripts/demo.sh
+#
+# The gateway listens on http://127.0.0.1:8080 (loopback only). Agents use
+# /mcp/demo; the admin API is under /v1 with WARDEN_ADMIN_TOKEN.
+
+name: mcp-warden
+
+x-warden-image: &warden-image
+  image: mcp-warden:local
+  build: .
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+x-database-url: &database-url
+  WARDEN_DATABASE_URL: postgresql+psycopg://warden:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/warden
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: warden
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: warden
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U warden -d warden"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: brings the schema up to date, then exits.
+  migrate:
+    <<: *warden-image
+    command: ["db", "upgrade"]
+    environment:
+      <<: *database-url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    healthcheck:
+      disable: true
+
+  # The deterministic fake MCP server standing in for a real tool server.
+  upstream:
+    <<: *warden-image
+    command: ["fake-upstream", "--host", "0.0.0.0", "--port", "9001"]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 9001), timeout=2).close()"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  warden:
+    <<: *warden-image
+    command: ["serve"]
+    environment:
+      <<: *database-url
+      WARDEN_POLICY_PATH: /etc/mcp-warden/policy/policy.yaml
+      WARDEN_UPSTREAMS_PATH: /etc/mcp-warden/upstreams.yaml
+      WARDEN_POLICY_RELOAD_INTERVAL_SECONDS: "5"
+      WARDEN_AUTH_MODE: api-key
+      WARDEN_RATE_LIMIT_STORE: database
+      WARDEN_USAGE_STORE: database
+      WARDEN_APPROVAL_STORE: database
+      WARDEN_AUDIT_STORE: database
+      WARDEN_RETENTION_INTERVAL_SECONDS: "3600"
+      WARDEN_LOG_FORMAT: json
+      WARDEN_ADMIN_TOKEN: ${WARDEN_ADMIN_TOKEN:?set WARDEN_ADMIN_TOKEN in .env}
+      WARDEN_AUDIT_HASH_KEY: ${WARDEN_AUDIT_HASH_KEY:?set WARDEN_AUDIT_HASH_KEY in .env}
+    volumes:
+      # The directory, not the file, so an editor's save is seen by the reloader.
+      - ./examples:/etc/mcp-warden/policy:ro
+      - ./deploy/upstreams.yaml:/etc/mcp-warden/upstreams.yaml:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      upstream:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # The scripted agent: `docker compose --profile demo run --rm demo`.
+  demo:
+    <<: *warden-image
+    profiles: [demo]
+    command: ["demo", "--gateway", "http://warden:8080"]
+    environment:
+      WARDEN_ADMIN_TOKEN: ${WARDEN_ADMIN_TOKEN:?set WARDEN_ADMIN_TOKEN in .env}
+    depends_on:
+      warden:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+volumes:
+  pgdata:

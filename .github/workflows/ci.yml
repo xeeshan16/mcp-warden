@@ -50,3 +50,42 @@ jobs:
         run: uv run mcp-warden check examples/policy.yaml
       - name: Build
         run: uv build
+
+  compose:
+    # The container image and the Compose stack, end to end: PostgreSQL,
+    # migrations, the fake upstream and the gateway, with the scripted demo
+    # agent run twice (the second run proves it can be repeated).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint the Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+      - name: Write throwaway secrets
+        run: |
+          umask 077
+          {
+            echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)"
+            echo "WARDEN_ADMIN_TOKEN=$(openssl rand -hex 24)"
+            echo "WARDEN_AUDIT_HASH_KEY=$(openssl rand -hex 24)"
+          } > .env
+      - name: Build the image
+        run: docker compose build
+      - name: The image runs as a non-root user
+        run: test "$(docker run --rm --entrypoint id mcp-warden:local -u)" = "10001"
+      - name: Start the stack
+        run: docker compose up --detach
+      - name: Run the demo
+        run: docker compose --profile demo run --rm demo
+      - name: Run the demo again
+        run: docker compose --profile demo run --rm demo
+      - name: The gateway is healthy
+        run: test "$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose ps -q warden)")" = "healthy"
+      - name: Show logs
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Stop the stack
+        if: always()
+        run: docker compose --profile demo down --volumes

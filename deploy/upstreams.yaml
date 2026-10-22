@@ -1,0 +1,8 @@
+# Upstreams for the Docker Compose stack: the fake MCP server runs as the
+# `upstream` service. Agents reach it through the gateway at /mcp/demo.
+version: 1
+servers:
+  - name: demo
+    description: The deterministic fake MCP server (`mcp-warden fake-upstream`).
+    url: http://upstream:9001/mcp
+    timeout_seconds: 10
