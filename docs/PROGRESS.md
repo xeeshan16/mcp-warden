@@ -442,3 +442,55 @@ request.
 
 **Next (day 12):** packaging and demo: Dockerfile, Docker Compose with PostgreSQL, the
 gateway and the demo MCP server, and a scripted end-to-end demo with a fake agent.
+
+## Day 12 — 2026-10-22: container image, Compose stack and demo agent
+
+**Done**
+
+- `mcp-warden demo` (`mcp_warden.demo`): a scripted agent that plays an operator on the
+  admin API and an MCP client with the key it issues. Ten steps, each with an
+  expectation: onboard `support-bot` and issue a key, open a session, `tools/list`
+  without `delete_records`, two allowed calls, two denials (a rule and an argument
+  matcher), an urgent ticket parked for approval, approved and collected, a ticket burst
+  tripping `demo-tickets`, a revoked key answered with `401`, this run's audit events
+  and the decision metrics. It exits non-zero if any step differs, waits for `/healthz`
+  first, never prints the key, reuses an existing agent, keys the approval to the run
+  and waits out a rate limit left by a previous run, so it can be repeated.
+- `Dockerfile`: a uv build stage that installs the locked dependencies (with the
+  `postgres` and `otel` extras) before copying the source, and a `python:3.12-slim`
+  runtime with only the virtual environment and the examples, an unprivileged user
+  (uid 10001) and a `/healthz` health check. `.dockerignore` keeps tests, docs, `.env`
+  and the git history out of the build context.
+- `compose.yaml`: PostgreSQL 16, a one-shot `migrate`, the fake upstream, the gateway
+  (API keys, every store on PostgreSQL, keyed audit digests, JSON logs, hourly
+  retention, policy hot reload from the mounted `examples/` directory) published on
+  loopback only, and the demo agent behind the `demo` profile. The gateway containers
+  run with a read-only root filesystem, no capabilities and `no-new-privileges`.
+  Secrets are required from `.env` (`.env.example` documents them);
+  `deploy/upstreams.yaml` points `demo` at the `upstream` service.
+- `scripts/demo.sh` writes a `.env` with random secrets if there is none, starts the
+  stack and runs the demo.
+- CI: a `compose` job lints the Dockerfile with hadolint, builds the image, checks it
+  runs as uid 10001, starts the stack, runs the demo twice and checks the gateway is
+  healthy, printing the logs on failure.
+- Tests no longer read a `.env` in the working directory: with a Compose `.env`
+  present, one audit test failed because the HMAC key from the file was picked up.
+
+**Tests:** 710 passing locally on SQLite (11 new) with 51 PostgreSQL variants skipped;
+760 passing with a local PostgreSQL 16, 99% line coverage (94% for `demo.py`). ruff,
+ruff format, strict mypy, hadolint and `uv build` clean. New tests run the demo against
+an in-process gateway on the example policy (all steps, the audit table, a repeat run
+with the rate limit waited out, the key never printed), against a gateway that allows
+everything (four steps fail and are named), with a wrong admin token, with metrics off
+or behind a token, and the CLI without a token or a gateway. Docker Hub is blocked on
+the build machine, so the image could not be built locally: the build stage was
+reproduced with the same uv commands into a separate environment, and the gateway was
+run from that non-editable install with the Compose configuration on PostgreSQL 16,
+where the demo passed; a repeat run passed against a SQLite gateway. The new CI job
+then built the image, started the stack and ran the demo twice, green on the first
+push; the README shows the output of that CI run.
+
+**Next (day 13):** hardening: property-based JSON-RPC fuzzing with Hypothesis, request
+size limits and header hygiene reviewed, policing `resources/*` and `prompts/*`, and a
+threat model document.
+

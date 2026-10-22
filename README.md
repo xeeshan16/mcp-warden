@@ -6,7 +6,7 @@
 **A self-hosted policy, budget and audit gateway for AI agent tool calls over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).**
 
-> Status: under active development (day 11 of a 14-day build). See
+> Status: under active development (day 12 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md)
 > for the daily log. Features marked _planned_ are not implemented yet.
 
@@ -59,7 +59,10 @@ with a policy file you can review in a pull request.
 | Prometheus metrics (`GET /metrics`) with bounded labels, optional bearer token | ✅ day 11 |
 | OpenTelemetry tracing: a span per request, W3C context from agent to upstream, OTLP export | ✅ day 11 |
 | Structured JSON logs with trace and span ids (`WARDEN_LOG_FORMAT=json`) | ✅ day 11 |
-| PostgreSQL persistence, Docker Compose demo | _planned_ |
+| Container image (multi-stage uv build, non-root user, health check) | ✅ day 12 |
+| Docker Compose stack: PostgreSQL, migrations, gateway and fake upstream; read-only, no capabilities | ✅ day 12 |
+| Scripted end-to-end demo agent (`mcp-warden demo`), run in CI against the Compose stack | ✅ day 12 |
+| PostgreSQL integration tests in CI, JSON-RPC fuzzing, threat model | _planned_ (day 13) |
 
 ## Architecture
 
@@ -654,6 +657,135 @@ mcp_warden_audit_events_written_total 3.0
 The denied call has a span and a metric but no upstream request: it never left the
 gateway.
 
+## Try it with Docker Compose
+
+The fastest way to see the gateway work: PostgreSQL, the migrations, the fake MCP server
+and the gateway in one stack, plus a scripted agent that walks through every feature.
+
+```bash
+git clone https://github.com/xeeshan16/mcp-warden.git
+cd mcp-warden
+scripts/demo.sh
+```
+
+`scripts/demo.sh` writes a `.env` with random secrets the first time (see
+[`.env.example`](.env.example); `.env` is git-ignored), runs
+`docker compose up --build --detach` and then the demo agent with
+`docker compose --profile demo run --rm demo`. The gateway stays up on
+`http://127.0.0.1:8080` (loopback only) for the admin API, `curl` and the CLI's
+`policy` and `demo` commands; `export $(grep WARDEN_ADMIN_TOKEN .env)` gives them the
+admin token.
+`docker compose --profile demo down --volumes` removes everything again.
+
+What the stack runs ([`compose.yaml`](compose.yaml)):
+
+| Service | Image | Role |
+| --- | --- | --- |
+| `postgres` | `postgres:16-alpine` | Agents, keys, rate-limit buckets, budget ledger, approvals, audit log |
+| `migrate` | `mcp-warden:local` | One-shot `mcp-warden db upgrade`; the gateway starts after it succeeds |
+| `upstream` | `mcp-warden:local` | `mcp-warden fake-upstream`, registered as `demo` in [`deploy/upstreams.yaml`](deploy/upstreams.yaml) |
+| `warden` | `mcp-warden:local` | The gateway: API keys, every store on PostgreSQL, keyed audit digests, JSON logs, policy hot reload |
+| `demo` | `mcp-warden:local` | `mcp-warden demo` (profile `demo`, run on demand) |
+
+The policy is [`examples/policy.yaml`](examples/policy.yaml), mounted read-only with its
+directory; edit it and the gateway reloads it within five seconds (a broken edit is
+refused and the previous policy stays in force). The [`Dockerfile`](Dockerfile) builds
+the locked dependencies with uv in a first stage and copies only the virtual environment
+into a slim runtime image, which runs as an unprivileged user with a `/healthz` health
+check; Compose adds a read-only root filesystem, no Linux capabilities and
+`no-new-privileges`.
+
+The demo agent plays both sides: an operator using the admin API and an MCP client
+using the key the operator issued. Each step states what it expects, so the script is
+also a smoke test that exits non-zero when the gateway behaves differently; CI builds the
+image, starts the stack and runs it twice (agents are reused and the approval is unique
+per run, so it can be repeated). It also works against any gateway that serves the
+example policy with the fake upstream as `demo`:
+`WARDEN_ADMIN_TOKEN=... uv run mcp-warden demo --gateway http://127.0.0.1:8080`.
+
+Output of the first demo run in CI, against the Compose stack built from this
+repository ([run 12](https://github.com/xeeshan16/mcp-warden/actions/runs/39759880584),
+Compose progress lines trimmed). Ids and keys differ on every run.
+
+```text
+$ docker compose --profile demo run --rm demo
+ Container mcp-warden-postgres-1  Healthy
+ Container mcp-warden-upstream-1  Healthy
+ Container mcp-warden-migrate-1  Exited
+MCP Warden demo against http://warden:8080 (server 'demo', run 68498f)
+
+▶ Operator onboards agent 'support-bot' and issues an API key
+  ✔ agent support-bot created
+  ✔ key 88d9b37ef3e8… issued (the full key is shown once, never stored)
+
+▶ Agent opens an MCP session through the gateway
+  ✔ connected to mcp-warden-fake-upstream 1.0.0, protocol 2025-11-25
+
+▶ tools/list only shows what the policy could allow
+  ✔ visible: echo, add, get_forecast, create_ticket, sleep (delete_records is hidden)
+
+▶ Allowed calls are forwarded
+  ✔ get_forecast → {"city": "Lisbon", "condition": "fog", "high_c": 25, "synthetic": true}  [rule read-only-everywhere]
+  ✔ add 2 + 40 → 42  [rule demo-basics]
+
+▶ Denied calls never reach the upstream
+  ✔ delete_records → -32001 denied by rule never-destructive
+  ✔ sleep 10s → -32001 denied by argument rule short-sleeps-only
+
+▶ A risky call waits for a human
+  ✔ urgent create_ticket → -32002 pending approval apr_ab4855d71b9d11707ba3f355
+  ✔ operator approves it (decided by admin)
+  ✔ agent repeats the identical call → created ticket T-F7AE07CF
+
+▶ A burst of ticket creation hits the rate limit
+  ✔ call 1 → created ticket T-0741E34F
+  ✔ call 2 → created ticket T-521DD883
+  ✔ call 3 → -32003 rate limited by demo-tickets, retry after 20s
+
+▶ Revoking the key cuts the agent off on its next request
+  ✔ key 88d9b37ef3e8… revoked; the next call gets HTTP 401
+
+▶ The audit log has the metadata of every call, never the payloads
+    tool            outcome          rule                          args
+    get_forecast    forwarded        read-only-everywhere           17B
+    add             forwarded        demo-basics                    14B
+    delete_records  denied           never-destructive              21B
+    sleep           denied           short-sleeps-only              14B
+    create_ticket   approval_pending urgent-tickets-need-a-human    62B
+    create_ticket   forwarded        urgent-tickets-need-a-human    62B
+    create_ticket   forwarded        support-bot-demo-tickets       28B
+    create_ticket   forwarded        support-bot-demo-tickets       28B
+    create_ticket   rate_limited     support-bot-demo-tickets       28B
+  ✔ 9 tool calls recorded with argument digests and sizes only
+
+▶ Prometheus metrics count the decisions
+    mcp_warden_policy_decisions_total{agent="support-bot",effect="allow",rule="demo-basics",server="demo"} 1.0
+    mcp_warden_policy_decisions_total{agent="support-bot",effect="allow",rule="read-only-everywhere",server="demo"} 1.0
+    mcp_warden_policy_decisions_total{agent="support-bot",effect="allow",rule="support-bot-demo-tickets",server="demo"} 3.0
+    mcp_warden_policy_decisions_total{agent="support-bot",effect="deny",rule="never-destructive",server="demo"} 1.0
+    mcp_warden_policy_decisions_total{agent="support-bot",effect="deny",rule="short-sleeps-only",server="demo"} 1.0
+    mcp_warden_policy_decisions_total{agent="support-bot",effect="require_approval",rule="urgent-tickets-need-a-human",server="demo"} 2.0
+  ✔ 6 decision series exported
+
+10 of 10 steps behaved as expected
+```
+
+The second run in the same job reused the agent and, because the first run had just
+used up the ticket rate limit, waited it out before collecting its approval:
+
+```text
+▶ Operator onboards agent 'support-bot' and issues an API key
+  ✔ agent support-bot already exists; reusing it
+  ...
+▶ A risky call waits for a human
+  ✔ urgent create_ticket → -32002 pending approval apr_8caeccfb4f5a9857c1cee248
+  ✔ operator approves it (decided by admin)
+    (rate limited from an earlier run; waiting 16s)
+  ✔ agent repeats the identical call → created ticket T-EEE4A80C
+  ...
+10 of 10 steps behaved as expected
+```
+
 ## Quick start
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
@@ -1047,7 +1179,12 @@ concurrency tests for shared rate limits, budgets and approvals, and the audit s
 and retention tests.
 
 CI runs the same lint, type-check, test and build steps on every push, with a
-PostgreSQL 16 service so the PostgreSQL variants run too.
+PostgreSQL 16 service so the PostgreSQL variants run too. A second job lints the
+Dockerfile with hadolint, builds the image, checks that it runs as a non-root user,
+starts the Compose stack and runs the demo agent against it twice.
+
+The tests never read a `.env` in the working directory (the one Compose uses), so local
+secrets cannot change their results.
 
 ## License
 

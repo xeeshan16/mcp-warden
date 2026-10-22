@@ -108,3 +108,9 @@ composes them as a pipeline so a stage can short-circuit with a JSON-RPC error.
   `opentelemetry-api` only; the SDK and OTLP exporter are an `otel` extra and the
   provider is per gateway, not global. MCP session ids are kept out of spans because they
   act as capabilities for the upstream session.
+- 2026-10-22: day 12 done as planned. The demo is a CLI command (`mcp-warden demo`)
+  rather than a shell script of `curl` calls, so it can assert every answer and serve as
+  the smoke test of the Compose stack in CI. Docker Hub is not reachable from the build
+  machine, so the image and the stack are verified in CI; locally the same configuration
+  was run as processes from a non-editable install on PostgreSQL 16. Since a local
+  `.env` now exists for Compose, the tests stop reading `.env`.
