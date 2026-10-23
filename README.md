@@ -6,7 +6,7 @@
 **A self-hosted policy, budget and audit gateway for AI agent tool calls over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).**
 
-> Status: under active development (day 12 of a 14-day build). See
+> Status: under active development (day 13 of a 14-day build). See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md)
 > for the daily log. Features marked _planned_ are not implemented yet.
 
@@ -62,7 +62,12 @@ with a policy file you can review in a pull request.
 | Container image (multi-stage uv build, non-root user, health check) | ✅ day 12 |
 | Docker Compose stack: PostgreSQL, migrations, gateway and fake upstream; read-only, no capabilities | ✅ day 12 |
 | Scripted end-to-end demo agent (`mcp-warden demo`), run in CI against the Compose stack | ✅ day 12 |
-| PostgreSQL integration tests in CI, JSON-RPC fuzzing, threat model | _planned_ (day 13) |
+| PostgreSQL variants of every store test in CI (PostgreSQL 16 service) | ✅ days 6–13 |
+| Prompts and resources in the policy: `prompts/get`, `resources/read` and `subscribe` checked, listings filtered | ✅ day 13 |
+| Ambiguous resource URIs refused (dot segments, encoded separators, backslashes, uppercase scheme) | ✅ day 13 |
+| Header hygiene: validated, unrepeated MCP headers, `Origin` allowlist, security headers, admin body cap | ✅ day 13 |
+| Property-based fuzzing (Hypothesis) of the parser, the policy engine and the gateway | ✅ day 13 |
+| [Threat model](docs/THREAT_MODEL.md) mapping each threat to its mitigation and tests | ✅ day 13 |
 
 ## Architecture
 
@@ -217,6 +222,104 @@ else in the result (the pagination cursor, `_meta`, each tool's schema and annot
 is forwarded untouched, and a `tools/list` result the gateway cannot read is refused
 with `-32005` instead of being passed through unfiltered. Batch entries are checked one
 by one.
+
+### Prompts and resources
+
+Tools are not the only way an agent can reach data: MCP servers also expose prompts
+(`prompts/get`) and resources (`resources/read`, `resources/subscribe`). A rule lists
+`prompts` (by name) or `resources` (by URI glob) instead of `tools`, and applies to that
+kind only; a rule that names none of them is a tool rule, so existing policies keep
+their meaning. The policy's `default` covers all three kinds, so under `default: deny`
+a prompt or resource nobody wrote an allow rule for is refused.
+
+```yaml
+  - id: demo-docs
+    effect: allow
+    servers: ["demo"]
+    resources: ["demo://docs/*"]     # in URI globs, * also matches /
+
+  - id: no-internal-documents
+    effect: deny
+    servers: ["demo"]
+    resources: ["demo://internal/*"]
+
+  - id: known-severities-only        # prompt rules may match the prompt's arguments
+    effect: deny
+    servers: ["demo"]
+    prompts: ["incident_report"]
+    arguments:
+      - {path: severity, one_of: ["low", "medium", "high", "critical"], not: true}
+```
+
+- `prompts/list` and `resources/list` are filtered like `tools/list`, and an unreadable
+  listing is refused rather than passed through.
+- `completion/complete` for a prompt the agent could never fetch is refused, so
+  completions do not reveal what a hidden prompt takes.
+- `resources/unsubscribe` is never denied, and resource templates are forwarded: every
+  URI built from a template is checked when it is read.
+- There is nothing to park for a human, so `require_approval` is only accepted on tool
+  rules; a prompt or resource is allowed or denied.
+- A glob only sees the URI as written, so URIs with dot segments (`docs/../internal`),
+  backslashes, percent-encoded `.`, `/` or `\`, or a scheme that is not lowercase are
+  refused with `-32602` before the policy is consulted, and hidden from listings.
+
+A session through the gateway with the example policy (real output, gateway and fake
+upstream run locally as processes):
+
+```text
+$ resources/list
+{"jsonrpc":"2.0","id":1,"result":{"resources":[{"uri":"demo://docs/readme","name":"readme","mimeType":"text/plain"},{"uri":"demo://docs/runbook","name":"runbook","mimeType":"text/plain"}]}}
+$ resources/read demo://internal/salaries
+{"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"resource denied by policy: demo://internal/salaries","data":{"server":"demo","uri":"demo://internal/salaries","effect":"deny","rule_id":"no-internal-documents","reason":"Internal documents never leave the demo server."}}}
+$ resources/read demo://docs/../internal/salaries
+{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"invalid resources/read params: uri: Value error, resource URI must not contain dot segments, backslashes or encoded '.', '/' or '\\'"}}
+$ prompts/get incident_report {"severity": "sev0"}
+{"jsonrpc":"2.0","id":4,"error":{"code":-32001,"message":"prompt denied by policy: incident_report","data":{"server":"demo","prompt":"incident_report","effect":"deny","rule_id":"known-severities-only","reason":"Incident reports are drafted for a known severity only."}}}
+$ prompts/get incident_report {"severity": "high"}
+{"jsonrpc":"2.0","id":5,"result":{"messages":[{"role":"user","content":{"type":"text","text":"Draft an incident report for a severity high outage."}}]}}
+```
+
+`mcp-warden check` and `POST /v1/policy/evaluate` dry-run prompt and resource decisions
+too (`--prompt NAME` / `--resource URI`, or `"target": "prompt" | "resource"`).
+
+### Header hygiene and request limits
+
+- Only `Mcp-Session-Id` and `MCP-Protocol-Version` cross to the upstream, and each is
+  validated first: it may appear once, a session id must be 1 to 1024 visible ASCII
+  characters and a protocol version must look like an MCP revision (`YYYY-MM-DD`).
+  Session ids an upstream hands out get the same check before they reach the agent.
+- A request to `/mcp/*` that carries an `Origin` header must name an allowed origin
+  (`WARDEN_ALLOWED_ORIGINS`, a JSON list, empty by default), which stops a web page from
+  driving a local gateway through DNS rebinding. Agents that are not browsers send no
+  `Origin` and are unaffected.
+- Every response carries `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`,
+  `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`, and `mcp-warden serve`
+  sends no `Server` header.
+- Bodies outside the MCP endpoint (the admin API) are capped at
+  `WARDEN_MAX_REQUEST_BYTES` (64 KiB), chunked ones included; the MCP endpoint keeps its
+  own `WARDEN_MAX_MESSAGE_BYTES` limit and answers with a JSON-RPC error.
+
+```text
+$ curl -i http://127.0.0.1:8080/mcp/demo -H 'content-type: application/json' \
+    -H 'origin: https://evil.example' -d '{"jsonrpc":"2.0","id":6,"method":"ping"}'
+HTTP/1.1 403 Forbidden
+date: Fri, 23 Oct 2026 10:20:46 GMT
+content-length: 82
+content-type: application/json
+x-content-type-options: nosniff
+cache-control: no-store
+x-frame-options: DENY
+referrer-policy: no-referrer
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"origin not allowed"}}
+$ curl -w ' HTTP %{http_code}\n' http://127.0.0.1:8080/mcp/demo -H 'content-type: application/json' \
+    -H 'mcp-protocol-version: 0' -d '[{"jsonrpc":"2.0","id":7,"method":"ping"}]'
+{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"invalid mcp-protocol-version header"}} HTTP 400
+```
+
+The second request used to be accepted as a batch: `0` sorts before `2025-06-18`, so it
+counted as an old revision that still allowed batching; it turned up while reviewing
+every header the gateway reads for the [threat model](docs/THREAT_MODEL.md).
 
 ### Rate limits
 
@@ -1154,8 +1257,9 @@ settings `WARDEN_RETENTION_DAYS` and `WARDEN_RETENTION_INTERVAL_SECONDS`, `WARDE
 `WARDEN_METRICS_TOKEN` and `WARDEN_METRICS_MAX_LABEL_VALUES`, the tracing settings
 `WARDEN_TRACING` (`off`, `console` or `otlp`), `WARDEN_OTLP_ENDPOINT`,
 `WARDEN_SERVICE_NAME` and `WARDEN_TRACE_SAMPLE_RATIO`, the parser
-limits `WARDEN_MAX_MESSAGE_BYTES`, `WARDEN_MAX_JSON_DEPTH`, `WARDEN_MAX_BATCH_SIZE`, and
-`WARDEN_MAX_UPSTREAM_RESPONSE_BYTES`).
+limits `WARDEN_MAX_MESSAGE_BYTES`, `WARDEN_MAX_JSON_DEPTH`, `WARDEN_MAX_BATCH_SIZE`,
+`WARDEN_MAX_UPSTREAM_RESPONSE_BYTES` and `WARDEN_MAX_REQUEST_BYTES` (admin API bodies),
+and `WARDEN_ALLOWED_ORIGINS`).
 
 ## Development
 
@@ -1167,6 +1271,14 @@ uv run pytest --cov=mcp_warden
 # New migration after changing the models (uses WARDEN_DATABASE_URL)
 uv run mcp-warden db upgrade && uv run alembic revision --autogenerate -m "describe change"
 ```
+
+`tests/test_properties.py` holds the property-based tests (Hypothesis): the parser
+fails only with JSON-RPC errors on arbitrary bytes and round-trips what it accepts, policy
+decisions do not depend on rule order and never weaken when a rule is added, a hidden
+tool is denied for every argument, and a fuzzed gateway in front of the example policy
+never answers with a 5xx and never forwards a denied call. They run in the normal suite
+with 200 to 300 examples each. Fuzzing the gateway found that the fake upstream crashed
+on `params` that were not an object; it now answers `-32602` like a real server.
 
 A test compares the migrated schema with the SQLAlchemy models, so a model change
 without a migration fails CI.

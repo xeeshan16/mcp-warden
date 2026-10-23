@@ -494,3 +494,51 @@ push; the README shows the output of that CI run.
 size limits and header hygiene reviewed, policing `resources/*` and `prompts/*`, and a
 threat model document.
 
+
+## Day 13 — 2026-10-23: prompts and resources, header hygiene, fuzzing, threat model
+
+**Done**
+
+- Prompts and resources are policed. A rule lists `prompts` (names) or `resources` (URI
+  globs) instead of `tools` and applies to that kind only; the policy default covers all
+  three. `prompts/get`, `resources/read` and `resources/subscribe` are evaluated before
+  forwarding (`-32001` with the rule, as for tools), `prompts/list` and `resources/list`
+  are filtered and fail closed, `completion/complete` is refused for prompts the agent
+  could never fetch, `resources/unsubscribe` is never denied and templates are forwarded.
+  Prompt rules may match the prompt's arguments; resource rules take none, and
+  `require_approval` is rejected on both at load time. Decisions are audited with
+  their effect and rule.
+- Resource URIs with dot segments, backslashes, percent-encoded `.`, `/` or `\`, or a
+  non-lowercase scheme are refused with `-32602` before the policy runs and hidden from
+  listings: each is a second spelling a glob would not recognise.
+- `mcp-warden check --prompt/--resource` and `"target"` on `POST /v1/policy/evaluate`
+  dry-run the new decisions. The example policy and the fake upstream gained prompts
+  and synthetic resources.
+- Header hygiene (`proxy/headers.py`): `Mcp-Session-Id` and `MCP-Protocol-Version` are
+  validated and may not be repeated; upstream session ids are checked before they are
+  relayed. A malformed protocol version such as `0` used to sort before 2025-06-18 and
+  unlock batches; it is now a 400.
+- `Origin` allowlist on `/mcp/*` (`WARDEN_ALLOWED_ORIGINS`, empty by default) against DNS
+  rebinding, as the MCP transport spec requires. Security headers on every response, no
+  `Server` header from `mcp-warden serve`, and a body cap for the admin API
+  (`WARDEN_MAX_REQUEST_BYTES`, 64 KiB) that also holds for chunked bodies.
+- Property-based tests with Hypothesis (`tests/test_properties.py`): parser robustness on
+  arbitrary bytes and JSON, exact round trips, depth and batch limits at every size,
+  rule-order independence, monotonicity when a rule is added, "hidden means denied for
+  every argument", per-kind isolation, and a fuzzed gateway that must never answer 5xx or
+  forward a denied call. Fuzzing found that the fake upstream crashed on non-object
+  `params`; fixed.
+- `docs/THREAT_MODEL.md`: assets, actors, a STRIDE table that maps each threat to the
+  module and tests that handle it, and the known gaps (no content inspection, templates
+  unfiltered, no server-to-client relaying, TLS outside the gateway, all-or-nothing
+  admin tokens).
+
+**Tests:** 834 passing locally on SQLite (124 new) with 51 PostgreSQL variants skipped;
+884 passing with a local PostgreSQL 16 (one test skipped), 99% line coverage (100% for
+`proxy/headers.py` and `jsonrpc/mcp.py`). ruff, ruff format and strict mypy clean. The
+README's prompt, resource and header examples are output from the gateway and fake
+upstream run locally as processes.
+
+**Next (day 14):** finish: README polish with real output, "How it works" Mermaid
+diagrams, setup verified from a clean clone, "What I'd do next" (server-to-client
+relaying, read-only admin roles, content inspection hooks), and the registry entry.

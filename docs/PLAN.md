@@ -114,3 +114,15 @@ composes them as a pipeline so a stage can short-circuit with a JSON-RPC error.
   machine, so the image and the stack are verified in CI; locally the same configuration
   was run as processes from a non-editable install on PostgreSQL 16. Since a local
   `.env` now exists for Compose, the tests stop reading `.env`.
+- 2026-10-23: day 13 done as planned, with a different emphasis. PostgreSQL integration
+  tests had been in CI since day 6 (every store test runs against a PostgreSQL 16
+  service), so the day went to policing `prompts/*` and `resources/*`, carried over from
+  day 4. Rules list `prompts` or `resources` instead of `tools` and apply to one kind;
+  the policy default covers all three, so prompts and resources are now refused under
+  `default: deny` unless allowed. That changes behaviour for existing policies, which is
+  the point: they used to pass unchecked. `require_approval` stays tools-only, since
+  there is no call to park. Resource URIs with dot segments or encoded separators are
+  refused rather than normalised, because the upstream's own normalisation is unknown.
+  Relaying server-to-client messages (the `GET` stream and requests on a POST's SSE
+  stream) did not fit and moves to "What I'd do next" in the README on day 14; the
+  threat model lists it as a known gap.
