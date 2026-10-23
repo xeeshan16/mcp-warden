@@ -125,6 +125,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         port=settings.port,
         log_level=settings.log_level,
         log_config=log_config,
+        # No "server: uvicorn" header: nothing about the stack is advertised.
+        server_header=False,
     )
     return 0
 

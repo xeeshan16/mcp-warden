@@ -83,6 +83,7 @@ from mcp_warden.proxy import (
     ProxyService,
     UpstreamTransport,
 )
+from mcp_warden.proxy.headers import origin_allowed
 from mcp_warden.ratelimit import (
     BucketStore,
     DatabaseBucketStore,
@@ -232,6 +233,98 @@ def _http_response(result: ProxyResult) -> Response:
 
 def _jsonrpc_http_error(status: int, code: ErrorCode, message: str) -> Response:
     return JSONResponse(to_wire(error_response(None, code, message)), status_code=status)
+
+
+# Sent with every response: nothing the gateway answers is a page to render,
+# sniff or cache (the admin API shows new API keys exactly once).
+SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"x-content-type-options", b"nosniff"),
+    (b"cache-control", b"no-store"),
+    (b"x-frame-options", b"DENY"),
+    (b"referrer-policy", b"no-referrer"),
+)
+
+
+class _RequestTooLargeError(Exception):
+    pass
+
+
+class _HardeningMiddleware:
+    """Security headers on every response and a body size cap on every request.
+
+    The MCP endpoint enforces its own (larger) limit and answers with a
+    JSON-RPC error, so paths under ``exempt_prefix`` are left to it; every
+    other route (the admin API) gets ``max_bytes``, checked against
+    ``Content-Length`` up front and against the bytes actually received for
+    chunked bodies.
+    """
+
+    def __init__(self, app: ASGIApp, max_bytes: int, exempt_prefix: str = "/mcp/") -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+        self.exempt_prefix = exempt_prefix
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = False
+        too_large = False
+
+        async def send_with_headers(message: Message) -> None:
+            if too_large:
+                # The route turned the aborted read into an error of its own
+                # (FastAPI answers 400); answer 413 instead, once.
+                if not started:
+                    await self._too_large(send_with_headers_raw)
+                return
+            await send_with_headers_raw(message)
+
+        async def send_with_headers_raw(message: Message) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+                present = {name.lower() for name, _ in message.get("headers", [])}
+                extra = [(n, v) for n, v in SECURITY_HEADERS if n not in present]
+                message = {**message, "headers": [*message.get("headers", []), *extra]}
+            await send(message)
+
+        if scope["path"].startswith(self.exempt_prefix):
+            await self.app(scope, receive, send_with_headers_raw)
+            return
+        declared = dict(scope.get("headers", [])).get(b"content-length")
+        if declared is not None and declared.isdigit() and int(declared) > self.max_bytes:
+            await self._too_large(send_with_headers_raw)
+            return
+        received = 0
+
+        async def counting_receive() -> Message:
+            nonlocal received, too_large
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    too_large = True
+                    raise _RequestTooLargeError
+            return message
+
+        try:
+            await self.app(scope, counting_receive, send_with_headers)
+        except _RequestTooLargeError:
+            if not started:
+                await self._too_large(send_with_headers_raw)
+
+    @staticmethod
+    async def _too_large(send: Send) -> None:
+        response = JSONResponse({"detail": "request body too large"}, status_code=413)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": response.raw_headers,
+            }
+        )
+        await send({"type": "http.response.body", "body": response.body})
 
 
 class _HttpMetricsMiddleware:
@@ -480,6 +573,7 @@ def create_app(
     app.state.retention = retention
     app.state.metrics = metrics
     app.state.tracer_provider = tracer_provider
+    app.add_middleware(_HardeningMiddleware, max_bytes=settings.max_request_bytes)
     if metrics is not None:
         app.add_middleware(_HttpMetricsMiddleware, metrics=metrics)
         metrics_token = (
@@ -640,9 +734,18 @@ def create_app(
 
     app.include_router(admin_router)
 
+    allowed_origins = frozenset(o.lower() for o in settings.allowed_origins)
+
+    def _origin_refused() -> Response:
+        if metrics is not None:
+            metrics.rejected("origin_not_allowed")
+        return _jsonrpc_http_error(403, ErrorCode.INVALID_REQUEST, "origin not allowed")
+
     @app.post("/mcp/{server}", tags=["proxy"])
     async def mcp_post(server: str, request: Request, proxy: ProxyDep) -> Response:
         """Streamable HTTP endpoint: forward JSON-RPC to the named upstream."""
+        if not origin_allowed(request.headers.get("origin"), allowed_origins):
+            return _origin_refused()
         content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
         if content_type != "application/json":
             if metrics is not None:
@@ -661,7 +764,9 @@ def create_app(
         return _http_response(result)
 
     @app.api_route("/mcp/{server}", methods=["GET", "DELETE"], tags=["proxy"])
-    async def mcp_not_supported(server: str) -> Response:
+    async def mcp_not_supported(server: str, request: Request) -> Response:
+        if not origin_allowed(request.headers.get("origin"), allowed_origins):
+            return _origin_refused()
         # Server-initiated SSE streams and explicit session teardown are not
         # proxied yet; MCP lets a server answer both with 405.
         return Response(status_code=405, headers={"allow": "POST"})

@@ -37,7 +37,8 @@ milestones — independent of how the agent packaged its calls, and means an
 upstream never sees a batch it might not support.
 
 Only ``Mcp-Session-Id`` and ``MCP-Protocol-Version`` cross the gateway from
-the agent. The agent's own credentials (``Authorization`` and the like) are
+the agent, each validated and never repeated (see
+:mod:`mcp_warden.proxy.headers`). The agent's own credentials (``Authorization`` and the like) are
 for the gateway, never for the upstream; upstream credentials come from the
 upstream registry.
 """
@@ -101,17 +102,19 @@ from mcp_warden.observability.tracing import (
 )
 from mcp_warden.policy import Effect
 from mcp_warden.proxy.client import (
-    PROTOCOL_HEADER,
-    SESSION_HEADER,
     UpstreamResponse,
     UpstreamSessionNotFoundError,
     UpstreamTransport,
 )
 from mcp_warden.proxy.enforcement import PolicyGuard
+from mcp_warden.proxy.headers import (
+    PROTOCOL_HEADER,
+    SESSION_HEADER,
+    HeaderError,
+    forwarded_headers,
+)
 from mcp_warden.ratelimit import RateLimiter
 from mcp_warden.upstreams import Upstream, UpstreamRegistry
-
-FORWARDED_HEADERS: tuple[str, ...] = (SESSION_HEADER, PROTOCOL_HEADER)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,11 +132,6 @@ class _Outcome:
     session_id: str | None = None
     retry_after: int | None = None
     event: AuditEvent | None = None
-
-
-def forwarded_headers(headers: Mapping[str, str]) -> dict[str, str]:
-    lowered = {k.lower(): v for k, v in headers.items()}
-    return {name: lowered[name] for name in FORWARDED_HEADERS if lowered.get(name)}
 
 
 class ProxyService:
@@ -180,7 +178,13 @@ class ProxyService:
             )
             return ProxyResult(404, to_wire(err))
 
-        forwarded = forwarded_headers(headers)
+        try:
+            forwarded = forwarded_headers(headers)
+        except HeaderError as exc:
+            self._rejected("invalid_header")
+            return ProxyResult(
+                400, to_wire(error_response(None, ErrorCode.INVALID_REQUEST, str(exc)))
+            )
         limits = replace(self.limits, allow_batch=batching_allowed(forwarded.get(PROTOCOL_HEADER)))
         try:
             parsed = parse_payload(body, limits)

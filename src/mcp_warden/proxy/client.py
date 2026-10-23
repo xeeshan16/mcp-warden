@@ -38,11 +38,10 @@ from mcp_warden.jsonrpc import (
     decode_json,
     parse_object,
 )
+from mcp_warden.proxy.headers import SESSION_HEADER, valid_session_id
 from mcp_warden.proxy.sse import iter_sse_events
 from mcp_warden.upstreams import Upstream
 
-SESSION_HEADER = "mcp-session-id"
-PROTOCOL_HEADER = "mcp-protocol-version"
 ACCEPT = "application/json, text/event-stream"
 
 UpstreamResponse = JsonRpcSuccess | JsonRpcErrorResponse
@@ -183,6 +182,13 @@ class HttpUpstreamClient:
         session_id = resp.headers.get(SESSION_HEADER)
         if resp.status_code == 404 and sent_session:
             raise UpstreamSessionNotFoundError(upstream.name)
+        if session_id is not None and not valid_session_id(session_id):
+            # Passed back to the agent and forwarded again: never relay junk.
+            raise _upstream_error(
+                upstream,
+                "upstream sent an invalid session id",
+                UpstreamFailureKind.INVALID_RESPONSE,
+            )
         if response_id is None:
             # Notifications and responses: the server acknowledges with 202.
             if resp.status_code in (200, 202, 204):

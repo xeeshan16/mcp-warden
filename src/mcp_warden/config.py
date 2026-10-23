@@ -174,6 +174,18 @@ class Settings(BaseSettings):
     )
     max_json_depth: int = Field(default=64, ge=1, description="Deepest JSON nesting accepted.")
     max_batch_size: int = Field(default=50, ge=1, description="Most messages in one batch.")
+    max_request_bytes: int = Field(
+        default=65_536,
+        ge=1,
+        description="Largest request body accepted outside the MCP endpoint (admin API), in bytes.",
+    )
+    allowed_origins: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Origins (scheme://host[:port]) allowed to call the MCP endpoint, as a JSON list. "
+            "Requests without an Origin header (non-browser agents) are always allowed."
+        ),
+    )
     max_upstream_response_bytes: int = Field(
         default=10_000_000, ge=1, description="Largest upstream reply accepted, in bytes."
     )
