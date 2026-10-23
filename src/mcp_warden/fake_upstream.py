@@ -195,6 +195,8 @@ def create_fake_upstream(*, sse: bool = False, require_session: bool = True) -> 
         request_id = message.get("id")
         method = message.get("method")
         params = message.get("params") or {}
+        if not isinstance(params, dict):
+            return _error(request_id, -32602, "params must be an object")
         if method == "initialize":
             counter += 1
             requested = str(params.get("protocolVersion", LATEST_PROTOCOL_VERSION))
@@ -217,6 +219,8 @@ def create_fake_upstream(*, sse: bool = False, require_session: bool = True) -> 
         if method == "tools/call":
             name = params.get("name")
             args = params.get("arguments") or {}
+            if not isinstance(args, dict):
+                return _error(request_id, -32602, "arguments must be an object")
             try:
                 return _result(request_id, await call_tool(str(name), args))
             except KeyError:
@@ -225,8 +229,11 @@ def create_fake_upstream(*, sse: bool = False, require_session: bool = True) -> 
             return _result(request_id, {"prompts": PROMPTS})
         if method == "prompts/get":
             name = params.get("name")
+            prompt_args = params.get("arguments") or {}
+            if not isinstance(prompt_args, dict):
+                return _error(request_id, -32602, "arguments must be an object")
             try:
-                return _result(request_id, get_prompt(str(name), params.get("arguments") or {}))
+                return _result(request_id, get_prompt(str(name), prompt_args))
             except KeyError:
                 return _error(request_id, -32602, f"unknown prompt: {name}")
         if method == "resources/list":
@@ -242,7 +249,8 @@ def create_fake_upstream(*, sse: bool = False, require_session: bool = True) -> 
             contents = [{"uri": uri, "mimeType": "text/plain", "text": RESOURCES[uri]}]
             return _result(request_id, {"contents": contents})
         if method == "completion/complete":
-            value = str((params.get("argument") or {}).get("value", ""))
+            argument = params.get("argument")
+            value = str(argument.get("value", "")) if isinstance(argument, dict) else ""
             options = [s for s in ("low", "medium", "high", "critical") if s.startswith(value)]
             return _result(
                 request_id,
