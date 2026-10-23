@@ -2,9 +2,10 @@
 
 It speaks Streamable HTTP on ``POST /mcp`` and exposes a handful of tools whose
 names exercise the example policy (read-style, write-style and destructive
-tools). Every answer is a pure function of the input, so tests can assert on
-exact output; no network, clock or randomness is involved, except the
-``sleep`` tool, which exists to test upstream timeouts.
+tools), two prompts and three synthetic text resources. Every answer is a
+pure function of the input, so tests can assert on exact output; no network,
+clock or randomness is involved, except the ``sleep`` tool, which exists to
+test upstream timeouts.
 
 With ``sse=True`` requests are answered with a ``text/event-stream`` that sends
 a progress notification before the response, like servers that stream.
@@ -81,6 +82,30 @@ TOOLS: list[dict[str, Any]] = [
     },
 ]
 
+PROMPTS: list[dict[str, Any]] = [
+    {
+        "name": "summarize",
+        "description": "Ask for a short summary of a text.",
+        "arguments": [{"name": "text", "required": True}],
+    },
+    {
+        "name": "incident_report",
+        "description": "Draft an incident report at a given severity.",
+        "arguments": [{"name": "severity", "required": True}],
+    },
+]
+
+# Synthetic documents; nothing here is real.
+RESOURCES: dict[str, str] = {
+    "demo://docs/readme": "The demo server answers deterministically.",
+    "demo://docs/runbook": "Step 1: read the dashboard. Step 2: page nobody.",
+    "demo://internal/salaries": "Synthetic placeholder: no real data.",
+}
+
+RESOURCE_TEMPLATES: list[dict[str, Any]] = [
+    {"uriTemplate": "demo://docs/{name}", "name": "Demo documents"},
+]
+
 _CONDITIONS = ("sunny", "cloudy", "rain", "windy", "fog")
 
 
@@ -136,6 +161,22 @@ async def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     raise KeyError(name)
 
 
+def get_prompt(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    if name == "summarize":
+        text = f"Summarize in one sentence: {args.get('text', '')}"
+    elif name == "incident_report":
+        text = f"Draft an incident report for a severity {args.get('severity', '?')} outage."
+    else:
+        raise KeyError(name)
+    return {"messages": [{"role": "user", "content": {"type": "text", "text": text}}]}
+
+
+def _resource_list() -> list[dict[str, Any]]:
+    return [
+        {"uri": uri, "name": uri.rsplit("/", 1)[-1], "mimeType": "text/plain"} for uri in RESOURCES
+    ]
+
+
 def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
@@ -161,7 +202,11 @@ def create_fake_upstream(*, sse: bool = False, require_session: bool = True) -> 
                 request_id,
                 {
                     "protocolVersion": negotiate_protocol_version(requested),
-                    "capabilities": {"tools": {"listChanged": False}},
+                    "capabilities": {
+                        "tools": {"listChanged": False},
+                        "prompts": {"listChanged": False},
+                        "resources": {"subscribe": True, "listChanged": False},
+                    },
                     "serverInfo": SERVER_INFO,
                 },
             )
@@ -176,6 +221,33 @@ def create_fake_upstream(*, sse: bool = False, require_session: bool = True) -> 
                 return _result(request_id, await call_tool(str(name), args))
             except KeyError:
                 return _error(request_id, -32602, f"unknown tool: {name}")
+        if method == "prompts/list":
+            return _result(request_id, {"prompts": PROMPTS})
+        if method == "prompts/get":
+            name = params.get("name")
+            try:
+                return _result(request_id, get_prompt(str(name), params.get("arguments") or {}))
+            except KeyError:
+                return _error(request_id, -32602, f"unknown prompt: {name}")
+        if method == "resources/list":
+            return _result(request_id, {"resources": _resource_list()})
+        if method == "resources/templates/list":
+            return _result(request_id, {"resourceTemplates": RESOURCE_TEMPLATES})
+        if method in ("resources/read", "resources/subscribe", "resources/unsubscribe"):
+            uri = str(params.get("uri"))
+            if uri not in RESOURCES:
+                return _error(request_id, -32002, f"resource not found: {uri}")
+            if method != "resources/read":
+                return _result(request_id, {})
+            contents = [{"uri": uri, "mimeType": "text/plain", "text": RESOURCES[uri]}]
+            return _result(request_id, {"contents": contents})
+        if method == "completion/complete":
+            value = str((params.get("argument") or {}).get("value", ""))
+            options = [s for s in ("low", "medium", "high", "critical") if s.startswith(value)]
+            return _result(
+                request_id,
+                {"completion": {"values": options, "total": len(options), "hasMore": False}},
+            )
         return _error(request_id, -32601, f"method not found: {method}")
 
     @app.post("/mcp")

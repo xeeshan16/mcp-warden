@@ -77,6 +77,42 @@ rules:
     arguments:
       - {path: priority, equals: urgent}
 
+  # --- Prompts and resources -------------------------------------------------
+  # A rule lists `prompts` (by name, for prompts/get) or `resources` (by URI,
+  # for resources/read and resources/subscribe) instead of `tools`; a rule
+  # applies to exactly one of the three. `default` covers all of them, so a
+  # prompt or resource without an allow rule is refused here. Prompt rules may
+  # match the prompt's arguments; resource rules take none. There is no
+  # require_approval for prompts and resources: they are allowed or denied.
+  # In URI globs `*` also matches `/`. URIs with dot segments, backslashes or
+  # encoded '.', '/' or '\' are refused before the policy is consulted.
+
+  - id: demo-prompts
+    effect: allow
+    description: Any agent may fetch the demo server's prompts.
+    servers: ["demo"]
+    prompts: ["summarize", "incident_report"]
+
+  - id: known-severities-only
+    effect: deny
+    description: Incident reports are drafted for a known severity only.
+    servers: ["demo"]
+    prompts: ["incident_report"]
+    arguments:
+      - {path: severity, one_of: ["low", "medium", "high", "critical"], not: true}
+
+  - id: demo-docs
+    effect: allow
+    description: Any agent may read and subscribe to the demo documents.
+    servers: ["demo"]
+    resources: ["demo://docs/*"]
+
+  - id: no-internal-documents
+    effect: deny
+    description: Internal documents never leave the demo server.
+    servers: ["demo"]
+    resources: ["demo://internal/*"]
+
 # --- Human approval ----------------------------------------------------------
 # A call that ends up `require_approval` is parked as an approval request and
 # the agent gets error -32002 with an `approval_id`. A reviewer approves or

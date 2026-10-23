@@ -14,7 +14,9 @@ Responsibilities, in order:
    is spent only by a call that is actually forwarded), and the reply's
    tokens are booked against the budgets once it arrives;
    ``tools/list`` results are filtered on the way back, other
-   requests are forwarded and answered, notifications and client responses
+   requests are forwarded and answered (``prompts/get`` and
+   ``resources/read`` / ``subscribe`` after their own policy check, prompt and
+   resource listings filtered like tools), notifications and client responses
    are forwarded and acknowledged with ``202``;
 5. record one metadata-only event per request (see :mod:`mcp_warden.audit`);
    the events of one HTTP request feed the metrics and, when an audit store
@@ -71,7 +73,14 @@ from mcp_warden.jsonrpc import (
     parse_payload,
     to_wire,
 )
-from mcp_warden.jsonrpc.mcp import Method, batching_allowed, parse_call_tool
+from mcp_warden.jsonrpc.mcp import (
+    Method,
+    batching_allowed,
+    parse_call_tool,
+    parse_complete,
+    parse_get_prompt,
+    parse_resource,
+)
 from mcp_warden.observability.metrics import GatewayMetrics
 from mcp_warden.observability.tracing import (
     ATTR_AGENT,
@@ -326,14 +335,16 @@ class ProxyService:
                 if self.approvals is not None and approval_id is not None:
                     # Spent last, so a call refused by a limit keeps its approval.
                     await self.approvals.claim(approval_id, upstream.name, params.name)
+            else:
+                self._check_other(agent, upstream.name, request, trace)
             reply = await self.transport.send(
                 upstream, to_wire(request), response_id=request.id, headers=forwarded
             )
             response = reply.response
             if self.budgets is not None and reservation is not None and response is not None:
                 await self.budgets.settle(reservation, response)
-            if request.method == Method.TOOLS_LIST and isinstance(response, JsonRpcSuccess):
-                response = self.guard.filter_tools(agent, upstream.name, response)
+            if isinstance(response, JsonRpcSuccess):
+                response = self._filter_listing(agent, upstream.name, request.method, response)
         except JsonRpcError as exc:
             retry_after = exc.retry_after if isinstance(exc, RetryAfterError) else None
             event = self._refused(trace, exc)
@@ -344,6 +355,37 @@ class ProxyService:
         if trace is not None:
             event = self.audit.answered(trace, response)
         return _Outcome(response, reply.session_id, event=event)
+
+    def _check_other(
+        self, agent: str, server: str, request: JsonRpcRequest, trace: Trace | None
+    ) -> None:
+        """Policy checks for the methods other than ``tools/call`` that use a capability."""
+        if request.method == Method.PROMPTS_GET:
+            decision = self.guard.check_prompt(agent, server, parse_get_prompt(request))
+        elif request.method in (Method.RESOURCES_READ, Method.RESOURCES_SUBSCRIBE):
+            decision = self.guard.check_resource(agent, server, parse_resource(request))
+        elif request.method == Method.RESOURCES_UNSUBSCRIBE:
+            # Malformed URIs are refused; stopping a subscription is never denied.
+            parse_resource(request)
+            return
+        elif request.method == Method.COMPLETE:
+            self.guard.check_completion(agent, server, parse_complete(request))
+            return
+        else:
+            return
+        if trace is not None:
+            trace.effect, trace.rule_id = decision.effect.value, decision.rule_id
+
+    def _filter_listing(
+        self, agent: str, server: str, method: str, response: JsonRpcSuccess
+    ) -> JsonRpcSuccess:
+        if method == Method.TOOLS_LIST:
+            return self.guard.filter_tools(agent, server, response)
+        if method == Method.PROMPTS_LIST:
+            return self.guard.filter_prompts(agent, server, response)
+        if method == Method.RESOURCES_LIST:
+            return self.guard.filter_resources(agent, server, response)
+        return response
 
     def _refused(self, trace: Trace | None, exc: JsonRpcError) -> AuditEvent | None:
         if trace is None:

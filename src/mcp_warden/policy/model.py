@@ -1,9 +1,9 @@
 """Typed policy document model.
 
 A policy is a versioned list of rules. Each rule targets agents, upstream MCP
-servers and tools by glob pattern and carries one effect. The model is strict:
-unknown keys are rejected so that typos in a policy file fail loudly instead of
-silently widening access.
+servers and one kind of capability (tools, prompts or resources) by glob
+pattern and carries one effect. The model is strict: unknown keys are rejected
+so that typos in a policy file fail loudly instead of silently widening access.
 """
 
 from __future__ import annotations
@@ -37,6 +37,20 @@ class Effect(StrEnum):
 
 
 _PRECEDENCE = {Effect.ALLOW: 0, Effect.REQUIRE_APPROVAL: 1, Effect.DENY: 2}
+
+
+class Target(StrEnum):
+    """The kind of MCP capability a request uses and a rule applies to.
+
+    Tools are matched by name (``tools/call``), prompts by name
+    (``prompts/get``) and resources by URI (``resources/read`` and
+    ``resources/subscribe``).
+    """
+
+    TOOL = "tool"
+    PROMPT = "prompt"
+    RESOURCE = "resource"
+
 
 _MAX_PATTERN_LEN = 200
 
@@ -140,13 +154,20 @@ class ArgumentMatcher(BaseModel):
 class Rule(BaseModel):
     """A single policy rule.
 
-    ``agents``, ``servers`` and ``tools`` are lists of case-sensitive glob
-    patterns (``*``, ``?`` and ``[seq]``). A rule matches a request when every
-    one of the three lists has at least one matching pattern and every entry
-    in ``arguments`` holds for the call's arguments.
+    ``agents`` and ``servers`` are lists of case-sensitive glob patterns
+    (``*``, ``?`` and ``[seq]``). A rule applies to exactly one kind of
+    capability, chosen by which of ``tools``, ``prompts`` or ``resources`` it
+    lists (tool names, prompt names or resource URIs, also globs; ``*`` matches
+    ``/`` too). A rule that names none of them is a tool rule for every tool,
+    as before prompts and resources were policed.
+
+    A rule matches a request of its kind when every pattern list has at least
+    one matching pattern and every entry in ``arguments`` holds for the
+    request's arguments (``tools/call`` arguments or ``prompts/get``
+    arguments; resources take none).
 
     A rule with argument matchers is *conditional*: it can only be decided
-    once the arguments are known, which matters for ``tools/list`` filtering.
+    once the arguments are known, which matters for filtering listings.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -157,12 +178,61 @@ class Rule(BaseModel):
     agents: list[str] = Field(default_factory=lambda: ["*"])
     servers: list[str] = Field(default_factory=lambda: ["*"])
     tools: list[str] = Field(default_factory=lambda: ["*"])
+    prompts: list[str] | None = None
+    resources: list[str] | None = None
     arguments: list[ArgumentMatcher] = Field(default_factory=list, max_length=_MAX_MATCHERS)
 
     @field_validator("agents", "servers", "tools")
     @classmethod
     def _check_patterns(cls, value: list[str]) -> list[str]:
         return _validate_patterns(value)
+
+    @field_validator("prompts", "resources")
+    @classmethod
+    def _check_optional_patterns(cls, value: list[str] | None) -> list[str] | None:
+        return None if value is None else _validate_patterns(value)
+
+    @model_validator(mode="after")
+    def _one_target(self) -> Rule:
+        given = [
+            key
+            for key, present in (
+                ("tools", "tools" in self.model_fields_set),
+                ("prompts", self.prompts is not None),
+                ("resources", self.resources is not None),
+            )
+            if present
+        ]
+        if len(given) > 1:
+            raise ValueError(
+                f"rule {self.id!r} lists {' and '.join(given)}; "
+                "a rule applies to one of tools, prompts or resources"
+            )
+        if self.resources is not None and self.arguments:
+            raise ValueError(f"rule {self.id!r}: resources take no arguments to match")
+        if self.target is not Target.TOOL and self.effect is Effect.REQUIRE_APPROVAL:
+            raise ValueError(
+                f"rule {self.id!r}: require_approval is only available for tools; "
+                "prompts and resources are allowed or denied"
+            )
+        return self
+
+    @property
+    def target(self) -> Target:
+        if self.prompts is not None:
+            return Target.PROMPT
+        if self.resources is not None:
+            return Target.RESOURCE
+        return Target.TOOL
+
+    @property
+    def names(self) -> list[str]:
+        """The patterns for this rule's kind of capability."""
+        if self.prompts is not None:
+            return self.prompts
+        if self.resources is not None:
+            return self.resources
+        return self.tools
 
     @property
     def conditional(self) -> bool:

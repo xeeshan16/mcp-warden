@@ -32,7 +32,13 @@ from mcp_warden.db import DatabaseNotReadyError
 from mcp_warden.identity import IdentityError, IdentityStore
 from mcp_warden.observability.logs import logging_config
 from mcp_warden.observability.tracing import TracingUnavailableError
-from mcp_warden.policy import PolicyEngine, PolicyError, ToolCallRequest, load_policy_file
+from mcp_warden.policy import (
+    PolicyEngine,
+    PolicyError,
+    Target,
+    ToolCallRequest,
+    load_policy_file,
+)
 from mcp_warden.upstreams import UpstreamError
 
 if TYPE_CHECKING:
@@ -50,7 +56,12 @@ def _cmd_check(args: argparse.Namespace) -> int:
         f"{len(policy.rate_limits)} rate limits, {len(policy.budgets)} budgets, "
         f"default {policy.default.value})"
     )
-    if args.agent and args.server and args.tool:
+    name, target = args.tool, Target.TOOL
+    if args.prompt:
+        name, target = args.prompt, Target.PROMPT
+    elif args.resource:
+        name, target = args.resource, Target.RESOURCE
+    if args.agent and args.server and name:
         arguments = None
         if args.arguments is not None:
             try:
@@ -62,19 +73,21 @@ def _cmd_check(args: argparse.Namespace) -> int:
                 print("error: --arguments must be a JSON object", file=sys.stderr)
                 return 2
         decision = PolicyEngine(policy).evaluate(
-            ToolCallRequest(args.agent, args.server, args.tool, arguments)
+            ToolCallRequest(args.agent, args.server, name, arguments, target)
         )
         rule = decision.rule_id or "<default>"
-        print(
-            f"{decision.effect.value}: {args.agent} -> {args.server}/{args.tool} "
-            f"(rule {rule}: {decision.reason})"
+        what = (
+            f"{args.server}/{name}" if target is Target.TOOL else f"{args.server} {target} {name}"
         )
-        for limit in PolicyEngine(policy).rate_limits_for(args.agent, args.server, args.tool):
+        print(f"{decision.effect.value}: {args.agent} -> {what} (rule {rule}: {decision.reason})")
+        if target is not Target.TOOL:
+            return 0
+        for limit in PolicyEngine(policy).rate_limits_for(args.agent, args.server, name):
             print(
                 f"rate limit {limit.id}: {limit.requests}/{limit.per.value}, "
                 f"burst {limit.capacity}, per {limit.scope.value}"
             )
-        for budget in PolicyEngine(policy).budgets_for(args.agent, args.server, args.tool):
+        for budget in PolicyEngine(policy).budgets_for(args.agent, args.server, name):
             caps = [
                 f"{value} {name}"
                 for name, value in (("calls", budget.max_calls), ("tokens", budget.max_tokens))
@@ -644,9 +657,13 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("policy", type=Path)
     check.add_argument("--agent")
     check.add_argument("--server")
-    check.add_argument("--tool")
+    what = check.add_mutually_exclusive_group()
+    what.add_argument("--tool")
+    what.add_argument("--prompt", help="dry-run a prompts/get of this prompt instead")
+    what.add_argument("--resource", help="dry-run a resources/read of this URI instead")
     check.add_argument(
-        "--arguments", help="tool arguments as a JSON object, for rules with argument matchers"
+        "--arguments",
+        help="tool or prompt arguments as a JSON object, for rules with argument matchers",
     )
     check.set_defaults(func=_cmd_check)
 

@@ -1,4 +1,4 @@
-"""Policy-as-code: declarative rules deciding whether an agent may call a tool."""
+"""Policy-as-code: rules deciding whether an agent may use a tool, prompt or resource."""
 
 from mcp_warden.policy.engine import Decision, PolicyEngine, ToolCallRequest
 from mcp_warden.policy.loader import PolicyError, load_policy, load_policy_file, parse_policy
@@ -12,6 +12,7 @@ from mcp_warden.policy.model import (
     Policy,
     RateLimit,
     Rule,
+    Target,
 )
 from mcp_warden.policy.reload import PolicyChanges, PolicyReloader, ReloadResult
 
@@ -31,6 +32,7 @@ __all__ = [
     "RateLimit",
     "ReloadResult",
     "Rule",
+    "Target",
     "ToolCallRequest",
     "load_policy",
     "load_policy_file",

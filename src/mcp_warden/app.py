@@ -74,7 +74,7 @@ from mcp_warden.observability.tracing import (
     shutdown_provider,
     tracer_from,
 )
-from mcp_warden.policy import PolicyEngine, PolicyError, PolicyReloader, ToolCallRequest
+from mcp_warden.policy import PolicyEngine, PolicyError, PolicyReloader, Target, ToolCallRequest
 from mcp_warden.proxy import (
     HttpUpstreamClient,
     InstrumentedTransport,
@@ -100,9 +100,14 @@ _NAME = r"^[A-Za-z0-9_.:/-]{1,200}$"
 class EvaluateRequest(BaseModel):
     agent: str = Field(pattern=_NAME)
     server: str = Field(pattern=_NAME)
-    tool: str = Field(pattern=_NAME)
+    tool: str = Field(
+        min_length=1,
+        max_length=2048,
+        description="Tool or prompt name, or resource URI, depending on target.",
+    )
+    target: Target = Target.TOOL
     arguments: dict[str, Any] | None = Field(
-        default=None, description="Tool arguments, for rules with argument matchers."
+        default=None, description="Tool or prompt arguments, for rules with argument matchers."
     )
 
 
@@ -523,7 +528,7 @@ def create_app(
     def evaluate(body: EvaluateRequest, engine: EngineDep) -> EvaluateResponse:
         """Dry-run a decision without calling any upstream server."""
         decision = engine.evaluate(
-            ToolCallRequest(body.agent, body.server, body.tool, body.arguments)
+            ToolCallRequest(body.agent, body.server, body.tool, body.arguments, body.target)
         )
         return EvaluateResponse(
             effect=decision.effect.value,

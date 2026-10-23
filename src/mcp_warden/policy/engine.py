@@ -9,7 +9,11 @@ rule matches, the policy's ``default`` effect applies.
 Order independence matters for a security control: appending an ``allow`` rule
 can never override an existing ``deny``, so policies stay safe to edit.
 
-Argument matchers are evaluated against the ``tools/call`` arguments. They are
+Requests name the kind of capability they use (:class:`Target`): a rule only
+ever matches requests of its own kind, while ``default`` covers all three, so
+a prompt or resource nobody wrote a rule for is refused under ``default: deny``.
+
+Argument matchers are evaluated against the request's arguments. They are
 pure functions of the policy and the arguments: no I/O, no clock, so a decision
 can always be replayed from an audit record.
 """
@@ -23,22 +27,32 @@ from fnmatch import translate
 from functools import lru_cache
 from typing import Any
 
-from mcp_warden.policy.model import ArgumentMatcher, Budget, Effect, Policy, RateLimit, Rule
+from mcp_warden.policy.model import (
+    ArgumentMatcher,
+    Budget,
+    Effect,
+    Policy,
+    RateLimit,
+    Rule,
+    Target,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class ToolCallRequest:
     """The facts a policy decision is made on.
 
-    ``arguments`` is the ``tools/call`` arguments object. ``None`` means the
-    arguments are not known (a dry run); conditional rules then see an empty
-    object.
+    ``tool`` is the name of the tool or prompt, or the resource URI, depending
+    on ``target``. ``arguments`` is the ``tools/call`` or ``prompts/get``
+    arguments object. ``None`` means the arguments are not known (a dry run);
+    conditional rules then see an empty object.
     """
 
     agent: str
     server: str
     tool: str
     arguments: Mapping[str, Any] | None = None
+    target: Target = Target.TOOL
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,10 +154,19 @@ def matcher_holds(matcher: ArgumentMatcher, arguments: Mapping[str, Any]) -> boo
 
 
 def _identity_matches(rule: Rule | RateLimit | Budget, request: ToolCallRequest) -> bool:
+    if isinstance(rule, Rule):
+        if rule.target is not request.target:
+            return False
+        names = rule.names
+    elif request.target is Target.TOOL:
+        # Rate limits and budgets only ever apply to tool calls.
+        names = rule.tools
+    else:
+        return False
     return (
         _matches_any(request.agent, rule.agents)
         and _matches_any(request.server, rule.servers)
-        and _matches_any(request.tool, rule.tools)
+        and _matches_any(request.tool, names)
     )
 
 
@@ -154,8 +177,10 @@ def rule_matches(rule: Rule, request: ToolCallRequest) -> bool:
     return all(matcher_holds(m, arguments) for m in rule.arguments)
 
 
-def _always_denied(policy: Policy, agent: str, server: str, tool: str) -> bool:
-    probe = ToolCallRequest(agent, server, tool)
+def _always_denied(
+    policy: Policy, agent: str, server: str, tool: str, target: Target = Target.TOOL
+) -> bool:
+    probe = ToolCallRequest(agent, server, tool, target=target)
     candidates = [r for r in policy.rules if _identity_matches(r, probe)]
     if any(r.effect is Effect.DENY and not r.conditional for r in candidates):
         return True
@@ -203,8 +228,10 @@ class PolicyEngine:
             matched_rule_ids=tuple(r.id for r in matched),
         )
 
-    def always_denied(self, agent: str, server: str, tool: str) -> bool:
-        """Whether every possible call of ``tool`` would be denied.
+    def always_denied(
+        self, agent: str, server: str, tool: str, target: Target = Target.TOOL
+    ) -> bool:
+        """Whether every possible call of ``tool`` (or use of a prompt or resource) is denied.
 
         Arguments are unknown when a tool is listed, so conditional rules count
         as "might match": a conditional ``deny`` cannot hide a tool, and a
@@ -213,7 +240,7 @@ class PolicyEngine:
         the default is ``deny``. Every call is still checked with its real
         arguments, so this only decides what the agent is shown.
         """
-        return _always_denied(self._policy, agent, server, tool)
+        return _always_denied(self._policy, agent, server, tool, target)
 
     def visible_tools(self, agent: str, server: str, tools: list[str]) -> list[str]:
         """Filter a tool listing down to tools the agent could ever invoke.

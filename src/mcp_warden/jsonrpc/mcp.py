@@ -1,9 +1,11 @@
 """Typed views of the MCP methods the gateway inspects.
 
 Only the messages that carry policy-relevant information are modelled:
-``initialize`` (who is the client, which protocol revision), ``tools/list``
-(what the agent can see) and ``tools/call`` (what it wants to run). Every other
-method is passed through as an opaque JSON-RPC message.
+``initialize`` (who is the client, which protocol revision), the listings of
+tools, prompts and resources (what the agent can see), and ``tools/call``,
+``prompts/get``, ``resources/read`` / ``resources/subscribe`` and
+``completion/complete`` (what it wants to use). Every other method is passed
+through as an opaque JSON-RPC message.
 
 Unlike the JSON-RPC envelope, these models allow unknown members: MCP adds
 optional fields between revisions, and the gateway must forward them intact.
@@ -12,10 +14,18 @@ Fields the gateway relies on are validated strictly.
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictStr,
+    ValidationError,
+    field_validator,
+)
 
 from mcp_warden.jsonrpc.errors import ErrorCode, JsonRpcError
 from mcp_warden.jsonrpc.messages import JsonRpcRequest
@@ -28,6 +38,14 @@ _BATCHING_REMOVED_IN = "2025-06-18"
 _OPEN = ConfigDict(extra="allow", frozen=True, populate_by_name=True)
 
 _TOOL_NAME = r"^[A-Za-z0-9_.:/-]{1,200}$"
+# MCP does not restrict prompt names; control characters are still refused.
+_PROMPT_NAME = r"^[^\x00-\x1f\x7f]{1,200}$"
+_MAX_URI = 2048
+# A lowercase scheme, then no whitespace or control characters.
+_URI = r"^[a-z][a-z0-9+.-]*:[^\x00-\x20\x7f]+$"
+# Spellings that make one resource look like another to a glob: dot segments,
+# percent-encoded dots, slashes and backslashes, and backslashes themselves.
+_AMBIGUOUS_URI = re.compile(r"(^|/)\.{1,2}(/|$|[?#])|%2e|%2f|%5c|\\", re.IGNORECASE)
 
 
 class Method(StrEnum):
@@ -37,6 +55,14 @@ class Method(StrEnum):
     TOOLS_LIST = "tools/list"
     TOOLS_CALL = "tools/call"
     TOOLS_LIST_CHANGED = "notifications/tools/list_changed"
+    PROMPTS_LIST = "prompts/list"
+    PROMPTS_GET = "prompts/get"
+    RESOURCES_LIST = "resources/list"
+    RESOURCES_READ = "resources/read"
+    RESOURCES_SUBSCRIBE = "resources/subscribe"
+    RESOURCES_UNSUBSCRIBE = "resources/unsubscribe"
+    RESOURCE_TEMPLATES_LIST = "resources/templates/list"
+    COMPLETE = "completion/complete"
     CANCELLED = "notifications/cancelled"
 
 
@@ -100,6 +126,85 @@ class CallToolResult(BaseModel):
     structured_content: dict[str, Any] | None = Field(default=None, alias="structuredContent")
 
 
+def _unambiguous_uri(value: str) -> str:
+    if _AMBIGUOUS_URI.search(value):
+        raise ValueError(
+            "resource URI must not contain dot segments, backslashes or encoded '.', '/' or '\\'"
+        )
+    return value
+
+
+class Prompt(BaseModel):
+    model_config = _OPEN
+
+    name: StrictStr = Field(pattern=_PROMPT_NAME)
+
+
+class ListPromptsResult(BaseModel):
+    model_config = _OPEN
+
+    prompts: list[Prompt]
+    next_cursor: StrictStr | None = Field(default=None, alias="nextCursor")
+
+
+class GetPromptParams(BaseModel):
+    model_config = _OPEN
+
+    name: StrictStr = Field(pattern=_PROMPT_NAME)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class Resource(BaseModel):
+    model_config = _OPEN
+
+    # Listings are filtered, never rejected, for odd URIs: an upstream's URI
+    # that a request could not use is simply hidden (see PolicyGuard).
+    uri: StrictStr = Field(min_length=1, max_length=_MAX_URI)
+
+
+class ListResourcesResult(BaseModel):
+    model_config = _OPEN
+
+    resources: list[Resource]
+    next_cursor: StrictStr | None = Field(default=None, alias="nextCursor")
+
+
+class ResourceParams(BaseModel):
+    """Params of ``resources/read``, ``resources/subscribe`` and ``resources/unsubscribe``."""
+
+    model_config = _OPEN
+
+    uri: StrictStr = Field(max_length=_MAX_URI, pattern=_URI)
+
+    @field_validator("uri")
+    @classmethod
+    def _check_uri(cls, value: str) -> str:
+        return _unambiguous_uri(value)
+
+
+class CompletionRef(BaseModel):
+    model_config = _OPEN
+
+    type: StrictStr
+    name: StrictStr | None = None
+    uri: StrictStr | None = None
+
+
+class CompleteParams(BaseModel):
+    model_config = _OPEN
+
+    ref: CompletionRef
+
+
+def is_valid_resource_uri(uri: str) -> bool:
+    """Whether a request could use ``uri`` (see :class:`ResourceParams`)."""
+    return (
+        len(uri) <= _MAX_URI
+        and re.fullmatch(_URI, uri) is not None
+        and _AMBIGUOUS_URI.search(uri) is None
+    )
+
+
 def _validate[M: BaseModel](model: type[M], data: Any, what: str) -> M:
     try:
         return model.model_validate(data)
@@ -125,6 +230,26 @@ def parse_call_tool(request: JsonRpcRequest) -> CallToolParams:
 
 def parse_list_tools_result(result: Any) -> ListToolsResult:
     return _validate(ListToolsResult, result, "tools/list result")
+
+
+def parse_get_prompt(request: JsonRpcRequest) -> GetPromptParams:
+    return _validate(GetPromptParams, request.params_object(), Method.PROMPTS_GET)
+
+
+def parse_resource(request: JsonRpcRequest) -> ResourceParams:
+    return _validate(ResourceParams, request.params_object(), request.method)
+
+
+def parse_complete(request: JsonRpcRequest) -> CompleteParams:
+    return _validate(CompleteParams, request.params_object(), Method.COMPLETE)
+
+
+def parse_list_prompts_result(result: Any) -> ListPromptsResult:
+    return _validate(ListPromptsResult, result, "prompts/list result")
+
+
+def parse_list_resources_result(result: Any) -> ListResourcesResult:
+    return _validate(ListResourcesResult, result, "resources/list result")
 
 
 def negotiate_protocol_version(requested: str) -> str:
