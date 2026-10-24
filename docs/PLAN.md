@@ -126,3 +126,10 @@ composes them as a pipeline so a stage can short-circuit with a JSON-RPC error.
   Relaying server-to-client messages (the `GET` stream and requests on a POST's SSE
   stream) did not fit and moves to "What I'd do next" in the README on day 14; the
   threat model lists it as a known gap.
+- 2026-10-24: day 14 done as planned, plus a Docker-free demo script. Verifying the quick
+  start from a clean clone showed that a plain `uv sync` (no extras) failed one tracing
+  test, because the OTLP exporter only ships with the `otel` extra; that test is now
+  split so the OTLP half skips without the extra. To keep the setup path from rotting,
+  `scripts/local-demo.sh` runs the demo agent against local processes on SQLite and a CI
+  job runs it from a fresh checkout. The build is complete; open items are in the README
+  under "What I'd do next" and in the threat model's known gaps.

@@ -542,3 +542,30 @@ upstream run locally as processes.
 **Next (day 14):** finish: README polish with real output, "How it works" Mermaid
 diagrams, setup verified from a clean clone, "What I'd do next" (server-to-client
 relaying, read-only admin roles, content inspection hooks), and the registry entry.
+
+## Day 14 — 2026-10-24: finish
+
+- Verified the setup from a clean clone (Python 3.13, uv): `uv sync`, `mcp-warden check`,
+  `mcp-warden db upgrade`, the test suite and a full demo run. A plain `uv sync` without
+  extras failed `test_building_providers_from_settings`, which needs the OTLP exporter
+  from the `otel` extra. The OTLP case is now its own test that skips without the
+  exporter; CI installs every extra, so it still runs there.
+- `scripts/local-demo.sh`: the demo agent against the gateway and the fake upstream run as
+  local processes, with a throwaway SQLite database, database-backed stores and random
+  secrets, cleaned up on exit (prints the gateway and upstream logs if a step fails). A
+  run from the clean clone took about 3.5 s and all 10 steps behaved as expected.
+- CI: a `clean-clone` job lints the shell scripts with shellcheck, installs the locked
+  dependencies without extras and runs the local demo from a fresh checkout.
+- README: status and contents, a "See it work" section with output from the clean-clone
+  run, "How it works" with the component diagram, a sequence diagram of a tool call
+  through authentication, policy, approval, rate limits, budgets and the upstream, and a
+  code map; Development now covers extras; "What I'd do next" (server-to-client
+  relaying, content inspection hooks, scoped admin roles, OAuth 2.1 for agents, policy
+  tests, template filtering, a Helm chart, load testing).
+
+**Tests:** 835 passing locally with every extra on SQLite, 51 PostgreSQL variants skipped
+(they run in CI against PostgreSQL 16). The clean clone without extras passes too, with
+the OTLP test skipped. ruff, ruff format, strict mypy and shellcheck clean.
+
+**Next:** the 14-day build is complete. Follow-ups are listed in the README under
+"What I'd do next".

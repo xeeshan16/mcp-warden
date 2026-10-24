@@ -6,9 +6,15 @@
 **A self-hosted policy, budget and audit gateway for AI agent tool calls over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).**
 
-> Status: under active development (day 13 of a 14-day build). See
-> [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md)
-> for the daily log. Features marked _planned_ are not implemented yet.
+> Status: feature-complete for its 14-day build (2026-10-11 to 2026-10-24). The plan is
+> in [docs/PLAN.md](docs/PLAN.md), the daily log in [docs/PROGRESS.md](docs/PROGRESS.md),
+> the known gaps in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) and
+> [What I'd do next](#what-id-do-next).
+
+**Contents:** [The problem](#the-problem) · [See it work](#see-it-work) ·
+[Features](#features) · [How it works](#how-it-works) ·
+[Docker Compose](#try-it-with-docker-compose) · [Quick start](#quick-start) ·
+[Development](#development) · [What I'd do next](#what-id-do-next)
 
 ## The problem
 
@@ -24,6 +30,61 @@ or "don't". That leaves platform teams without answers to basic questions:
 
 MCP Warden sits between agents and MCP servers and answers those questions centrally,
 with a policy file you can review in a pull request.
+
+## See it work
+
+From a fresh clone, with Python 3.12+ and [uv](https://docs.astral.sh/uv/) (no Docker,
+no API keys):
+
+```bash
+git clone https://github.com/xeeshan16/mcp-warden.git && cd mcp-warden
+uv sync
+scripts/local-demo.sh
+```
+
+[`scripts/local-demo.sh`](scripts/local-demo.sh) migrates a throwaway SQLite database,
+starts the deterministic fake MCP server and the gateway as local processes with random
+secrets, runs the scripted demo agent (`mcp-warden demo`) against them and removes
+everything on exit. Output from a run in a clean clone, trimmed where marked (the
+[Compose section](#try-it-with-docker-compose) has a complete run):
+
+```text
+$ scripts/local-demo.sh
+database at revision 0005
+MCP Warden demo against http://127.0.0.1:8080 (server 'demo', run 7e0eab)
+
+▶ Operator onboards agent 'support-bot' and issues an API key
+  ✔ agent support-bot created
+  ✔ key 9a2d9d30db15… issued (the full key is shown once, never stored)
+
+▶ Agent opens an MCP session through the gateway
+  ✔ connected to mcp-warden-fake-upstream 1.0.0, protocol 2025-11-25
+
+▶ tools/list only shows what the policy could allow
+  ✔ visible: echo, add, get_forecast, create_ticket, sleep (delete_records is hidden)
+  ...
+▶ Denied calls never reach the upstream
+  ✔ delete_records → -32001 denied by rule never-destructive
+  ✔ sleep 10s → -32001 denied by argument rule short-sleeps-only
+
+▶ A risky call waits for a human
+  ✔ urgent create_ticket → -32002 pending approval apr_96082e6a2a44c823cd237897
+  ✔ operator approves it (decided by admin)
+  ✔ agent repeats the identical call → created ticket T-4AA56FEC
+
+▶ A burst of ticket creation hits the rate limit
+  ✔ call 1 → created ticket T-9037377F
+  ✔ call 2 → created ticket T-7E0E91F9
+  ✔ call 3 → -32003 rate limited by demo-tickets, retry after 20s
+
+▶ Revoking the key cuts the agent off on its next request
+  ✔ key 9a2d9d30db15… revoked; the next call gets HTTP 401
+  ...
+10 of 10 steps behaved as expected
+```
+
+The CI job `clean-clone` runs the same script from a fresh checkout on every push, so
+this path is checked continuously.
 
 ## Features
 
@@ -68,8 +129,17 @@ with a policy file you can review in a pull request.
 | Header hygiene: validated, unrepeated MCP headers, `Origin` allowlist, security headers, admin body cap | ✅ day 13 |
 | Property-based fuzzing (Hypothesis) of the parser, the policy engine and the gateway | ✅ day 13 |
 | [Threat model](docs/THREAT_MODEL.md) mapping each threat to its mitigation and tests | ✅ day 13 |
+| Docker-free local demo (`scripts/local-demo.sh`), run from a clean checkout in CI | ✅ day 14 |
 
-## Architecture
+## How it works
+
+MCP Warden is a reverse proxy that speaks MCP's Streamable HTTP transport. Agents point
+their MCP client at `http://<warden>/mcp/<server>` instead of at the server itself and
+authenticate with a per-agent key; the gateway holds the upstream credentials. Every
+JSON-RPC message is parsed and checked before anything reaches the upstream, and every
+request leaves one metadata-only audit event, a metric and a trace span behind.
+
+### Components
 
 ```mermaid
 flowchart LR
@@ -87,12 +157,63 @@ flowchart LR
     W -.-> M[Prometheus / OTel]
 ```
 
-So far the policy engine (day 1), the JSON-RPC / MCP message layer (day 2), the proxy
-path to upstream servers (day 3), policy enforcement inside the proxy (day 4), agent
-authentication with API keys (day 5), rate limits (day 6), budgets (day 7), human
-approval (day 8), the audit log with its retention job (day 9), the admin API with
-policy hot reload (day 10) and observability (day 11) are in place. Packaging and the
-Docker Compose demo land next (see the plan).
+### Life of a tool call
+
+The order of the checks is deliberate: a denied or still-pending call never spends rate
+limit or budget, a rate-limited call never spends budget, and an approval is used up only
+by a call that is actually forwarded.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent (MCP client)
+    participant W as MCP Warden
+    participant H as Human reviewer
+    participant U as Upstream MCP server
+    A->>W: POST /mcp/github tools/call + Bearer key
+    W->>W: authenticate key (401 if missing, expired or revoked)
+    W->>W: validate MCP headers and Origin, parse JSON-RPC with limits
+    W->>W: policy: deny > require_approval > allow
+    alt deny
+        W-->>A: -32001 denied by rule
+    else require_approval and not yet approved
+        W-->>A: -32002 pending approval apr_… (Retry-After)
+        H->>W: POST /v1/approvals/{id}/approve
+        A->>W: same call again
+    end
+    W->>W: token-bucket rate limits (-32003 + Retry-After)
+    W->>W: reserve call and token budgets (-32004 when spent)
+    W->>W: claim the approval, if any
+    W->>U: forward with the upstream's own credentials
+    U-->>W: result (JSON or SSE)
+    W->>W: book actual tokens, write audit event, metrics, span
+    W-->>A: result
+```
+
+`tools/list`, `prompts/list` and `resources/list` take the same path, and their results
+are filtered on the way back so an agent only sees what it could be allowed to use.
+Notifications are forwarded and acknowledged with `202`; batches are split and checked
+entry by entry.
+
+### Code map
+
+| Package | Responsibility |
+| --- | --- |
+| [`policy/`](src/mcp_warden/policy) | YAML model, loader with validation, deny-overrides engine, hot reload |
+| [`jsonrpc/`](src/mcp_warden/jsonrpc) | Hardened JSON-RPC 2.0 parser, typed MCP messages, error codes |
+| [`proxy/`](src/mcp_warden/proxy) | The request pipeline, enforcement and list filtering, header hygiene, upstream client and SSE |
+| [`identity/`](src/mcp_warden/identity) | Agents and API keys (hashed at rest), authentication modes |
+| [`ratelimit/`](src/mcp_warden/ratelimit) | Token buckets in memory or in the database (row-locked on PostgreSQL) |
+| [`budget/`](src/mcp_warden/budget) | Calendar windows, token estimation, reserve-then-settle ledger |
+| [`approval/`](src/mcp_warden/approval) | Parked calls, single-use approvals bound to the exact arguments, expiry |
+| [`audit/`](src/mcp_warden/audit) | Metadata-only events with keyed argument digests, query API store |
+| [`admin/`](src/mcp_warden/admin) | Admin API for agents, keys, usage, approvals and policy, named bearer tokens |
+| [`observability/`](src/mcp_warden/observability) | Prometheus metrics with bounded labels, OpenTelemetry tracing, JSON logs |
+| [`db/`](src/mcp_warden/db) | SQLAlchemy models, engine setup and Alembic migrations |
+
+Rate limits, budgets, approvals and the audit log each have an in-memory and a database
+store behind one interface: a single gateway can keep them in process memory, and several
+gateways share them through PostgreSQL. Agents and keys always live in the database.
 
 ### Policy resolution
 
@@ -891,7 +1012,10 @@ used up the ticket rate limit, waited it out before collecting its approval:
 
 ## Quick start
 
-Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
+Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). These steps were checked from
+a clean clone on 2026-10-24 with Python 3.13 (`uv sync`, `mcp-warden check`,
+`mcp-warden db upgrade` and the full test suite); `scripts/local-demo.sh` wraps the
+remaining steps if you just want to see them run.
 
 ```bash
 git clone https://github.com/xeeshan16/mcp-warden.git
@@ -1264,6 +1388,7 @@ and `WARDEN_ALLOWED_ORIGINS`).
 ## Development
 
 ```bash
+uv sync --all-extras   # also the PostgreSQL driver and the OTLP exporter, as in CI
 uv run ruff check . && uv run ruff format --check .
 uv run mypy
 uv run pytest --cov=mcp_warden
@@ -1280,6 +1405,8 @@ never answers with a 5xx and never forwards a denied call. They run in the norma
 with 200 to 300 examples each. Fuzzing the gateway found that the fake upstream crashed
 on `params` that were not an object; it now answers `-32602` like a real server.
 
+With a plain `uv sync` the suite still passes; the tests that need an extra are skipped.
+
 A test compares the migrated schema with the SQLAlchemy models, so a model change
 without a migration fails CI.
 
@@ -1291,12 +1418,38 @@ concurrency tests for shared rate limits, budgets and approvals, and the audit s
 and retention tests.
 
 CI runs the same lint, type-check, test and build steps on every push, with a
-PostgreSQL 16 service so the PostgreSQL variants run too. A second job lints the
+PostgreSQL 16 service so the PostgreSQL variants run too. A second job checks the
+Docker-free path from a fresh checkout: it lints the shell scripts with shellcheck,
+installs the locked dependencies and runs `scripts/local-demo.sh`. A third lints the
 Dockerfile with hadolint, builds the image, checks that it runs as a non-root user,
 starts the Compose stack and runs the demo agent against it twice.
 
 The tests never read a `.env` in the working directory (the one Compose uses), so local
 secrets cannot change their results.
+
+## What I'd do next
+
+- **Relay server-to-client messages.** The optional `GET` stream answers `405` and
+  server-initiated requests on a POST's SSE stream (sampling, elicitation) are dropped.
+  Relaying them, with their own policy checks, would make every MCP feature usable
+  through the gateway.
+- **Content inspection hooks.** A pluggable stage after the upstream reply to scan tool
+  results and resource contents for secrets or prompt-injection markers, with a
+  deterministic built-in scanner and an optional model-backed one behind an interface.
+- **Read-only and scoped admin roles.** Admin tokens are all or nothing today; a
+  reviewer who approves calls should not be able to issue keys or reload the policy.
+- **OAuth 2.1 for agents.** Accept access tokens from an identity provider, as the MCP
+  authorization spec describes, alongside the gateway's own API keys.
+- **Policy tests in the policy file.** Expected decisions next to the rules
+  (`mcp-warden check --tests`), so a pull request that changes the policy shows which
+  decisions it changes.
+- **Filter resource templates and completions.** Both are forwarded unfiltered today
+  (every concrete URI is still checked when it is read).
+- **A Helm chart** with the gateway, migrations as a Job and a ServiceMonitor for the
+  metrics.
+- **Load testing.** No throughput or latency numbers are claimed here because none have
+  been measured; a reproducible k6 or Locust scenario against the fake upstream would be
+  the place to start.
 
 ## License
 
