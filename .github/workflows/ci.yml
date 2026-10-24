@@ -51,6 +51,24 @@ jobs:
       - name: Build
         run: uv build
 
+  clean-clone:
+    # The README's setup path without Docker, from a fresh checkout: install
+    # the locked dependencies, migrate a SQLite database, start the fake
+    # upstream and the gateway as processes and run the demo agent.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Lint the shell scripts
+        run: shellcheck scripts/*.sh
+      - name: Install
+        run: uv sync --locked
+      - name: Run the local demo
+        run: scripts/local-demo.sh
+
   compose:
     # The container image and the Compose stack, end to end: PostgreSQL,
     # migrations, the fake upstream and the gateway, with the scripted demo

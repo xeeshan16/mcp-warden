@@ -233,13 +233,23 @@ def test_malformed_incoming_trace_context_is_ignored() -> None:
 def test_building_providers_from_settings() -> None:
     assert build_tracer_provider(TracingMode.OFF) is None
     shutdown_provider(None)
-    for mode in (TracingMode.CONSOLE, TracingMode.OTLP):
-        provider = build_tracer_provider(
-            mode,
-            service_name="warden-test",
-            otlp_endpoint="http://127.0.0.1:9/v1/traces",
-            sample_ratio=0.5,
-        )
-        assert isinstance(provider, TracerProvider)
-        assert provider.resource.attributes["service.name"] == "warden-test"
-        shutdown_provider(provider)
+    _assert_builds(TracingMode.CONSOLE)
+
+
+def test_building_an_otlp_provider() -> None:
+    # The exporter ships with the ``otel`` extra (CI installs every extra);
+    # a plain ``uv sync`` has only the SDK from the dev group.
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
+    _assert_builds(TracingMode.OTLP)
+
+
+def _assert_builds(mode: TracingMode) -> None:
+    provider = build_tracer_provider(
+        mode,
+        service_name="warden-test",
+        otlp_endpoint="http://127.0.0.1:9/v1/traces",
+        sample_ratio=0.5,
+    )
+    assert isinstance(provider, TracerProvider)
+    assert provider.resource.attributes["service.name"] == "warden-test"
+    shutdown_provider(provider)
